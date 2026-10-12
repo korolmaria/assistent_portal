@@ -1,0 +1,33 @@
+# === LLM clients ===
+openai>=1.54.0
+httpx>=0.27.0
+
+# === Vector DB ===
+qdrant-client>=1.12.0
+
+# === Graph ===
+neo4j>=5.25.0
+
+# === Triton + embeddings ===
+tritonclient[http]>=2.50.0
+transformers>=4.45.0
+numpy>=1.26.0
+
+# === FastAPI ===
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+pydantic>=2.9.0
+pydantic-settings>=2.5.0
+python-multipart>=0.0.12
+
+# === Documents ===
+pypdf>=5.0.0
+pdf2image>=1.17.0
+python-docx>=1.1.0
+Pillow>=10.4.0
+
+# === Utils ===
+python-dotenv>=1.0.0
+loguru>=0.7.0
+tenacity>=9.0.0
+tqdm>=4.66.0

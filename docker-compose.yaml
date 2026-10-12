@@ -1,0 +1,108 @@
+services:
+  vllm-qwen-vl:
+    image: vllm/vllm-openai:latest
+    container_name: vllm-qwen-vl
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./models:/models
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=0
+      - HF_TOKEN=${HF_TOKEN:-}
+    command: >
+      /models/Qwen2.5-VL-7B-Instruct-AWQ
+      --served-model-name qwen-vl
+      --gpu-memory-utilization 0.85
+      --max-model-len 16384
+      --limit-mm-per-prompt '{"image": 3}'
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['0']
+              capabilities: [gpu]
+    shm_size: '16gb'
+
+  vllm-qwen-text:
+    image: vllm/vllm-openai:latest
+    container_name: vllm-qwen-text
+    restart: unless-stopped
+    ports:
+      - "8010:8000"
+    volumes:
+      - ./models:/models
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=1
+      - HF_TOKEN=${HF_TOKEN:-}
+    command: >
+      /models/Qwen3-8B-AWQ
+      --served-model-name qwen-text
+      --gpu-memory-utilization 0.75
+      --max-model-len 32768
+      --enable-auto-tool-choice
+      --tool-call-parser hermes
+      --reasoning-parser qwen3
+      --default-chat-template-kwargs '{"enable_thinking": false}'
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['1']
+              capabilities: [gpu]
+    shm_size: '16gb'
+
+  triton-bge:
+    image: nvcr.m.daocloud.io/nvidia/tritonserver:24.07-py3
+    container_name: triton-bge
+    restart: unless-stopped
+    ports:
+      - "8001:8000"
+      - "8002:8001"
+      - "8003:8002"
+    volumes:
+      - ./triton-models:/models
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=1
+    command: >
+      tritonserver
+      --model-repository=/models
+      --log-verbose=0
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['1']
+              capabilities: [gpu]
+    shm_size: '8gb'
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - ./qdrant_storage:/qdrant/storage
+
+  neo4j:
+    image: neo4j:5-community
+    container_name: neo4j
+    restart: unless-stopped
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    volumes:
+      - ./neo4j/data:/data
+      - ./neo4j/logs:/logs
+    environment:
+      - NEO4J_AUTH=neo4j/${NEO4J_PASSWORD:-changeme123}
+      - NEO4J_PLUGINS=["apoc"]
+      - NEO4J_dbms_memory_heap_initial__size=2G
+      - NEO4J_dbms_memory_heap_max__size=4G

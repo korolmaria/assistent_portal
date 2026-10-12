@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# venv
+venv/
+.venv/
+
+# Data
+data/uploads/*
+data/processed/*
+!data/uploads/.gitkeep
+!data/processed/.gitkeep
+
+# Models
+models/
+triton-models/
+bge-m3-onnx/
+qwen3-reranker-onnx/
+*.onnx
+*.safetensors
+
+# Qdrant
+qdrant_storage/
+
+# Neo4j
+neo4j/data/
+neo4j/logs/
+
+# Logs
+logs/*
+!logs/.gitkeep
+
+# Env
+.env
+.env.local
+
+# Docker
+docker-compose.yaml.bak.*
+docker-compose.yaml.broken.*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Дополнительно
+bge-reranker-onnx/
+data/.ingest_state.json
+*.log
+.DS_Store
