@@ -80,6 +80,46 @@ app/config.py - Настройки
 app/schemas.py - Pydantic-схемы
 app/main.py - FastAPI + SSE
 
+## Управление запуском
+
+### Скрипты
+
+В корне проекта три скрипта для управления:
+
+| Скрипт | Когда использовать |
+|---|---|
+| `./start.sh` | Первый запуск после выключения сервера |
+| `./restart.sh` | Перезапуск FastAPI после правок кода |
+| `./status.sh` | Быстрая проверка состояния системы |
+
+Флаги:
+
+--ingest — после запуска загрузить новые документы из data/uploads/
+--no-wait — не ждать готовности vLLM (проверить вручную позже)
+--fast — только FastAPI (Docker-контейнеры не трогать)
+
+### start.sh — полный запуск
+
+Запускает Docker-контейнеры, ждёт готовности vLLM (3-5 минут), запускает FastAPI, проверяет health.
+
+# Статус ingest (что уже загружено)
+python -m scripts.ingest_docs --status
+
+# Загрузить все новые документы
+python -m scripts.ingest_docs --dir data/uploads/
+
+# Загрузить один файл
+python -m scripts.ingest_docs --file data/uploads/reglament.pdf
+
+# Полная переиндексация (ВНИМАНИЕ: 30-60 минут)
+python -m scripts.ingest_docs --dir data/uploads/ --recreate
+
+# Помощь
+python -m scripts.ingest_docs --help
+
+```bash
+./start.sh
+
 ## Лицензия
 
 Proprietary - внутренний проект ООО «Евроторг».
