@@ -28,7 +28,7 @@ app = FastAPI(title="Assistant Eportal API", version="0.1.0")
 # CORS — разрешаем фронту обращаться
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # TODO: сузить в проде до домена фронта
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -58,7 +58,6 @@ def _extract_jwt(authorization: str | None) -> str:
 
     logger.warning(f"[auth] Нестандартный формат: {authorization[:80]}")
     return authorization
-
 
 
 def _sse_event(data: dict) -> str:
@@ -210,15 +209,13 @@ async def health():
         neo4j=False,
     )
 
+
 # ==========================================================================
 # Проверка JWT (для отладки)
 # ==========================================================================
 @app.get("/api/v1/whoami")
 async def whoami(authorization: str | None = Header(default=None)):
-    """
-    Проверка: приходит ли JWT на бэк.
-    Показывает заголовок Authorization без раскрытия полного токена.
-    """
+    """Проверка: приходит ли JWT на бэк."""
     jwt = _extract_jwt(authorization)
 
     return {
@@ -231,7 +228,6 @@ async def whoami(authorization: str | None = Header(default=None)):
         "jwt_first_20": jwt[:20] if jwt else None,
         "jwt_last_20": jwt[-20:] if len(jwt) > 20 else None,
     }
-
 
 
 # ==========================================================================
