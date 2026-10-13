@@ -52,3 +52,6 @@ bge-reranker-onnx/
 data/.ingest_state.json
 *.log
 .DS_Store
+
+# Env backups
+.env.bak.*
