@@ -69,6 +69,8 @@ class SupplierPortalClient:
             response.raise_for_status()
             result = response.json()
 
+        logger.info(f"[SupplierPortal] RAW ответ: {str(result)[:1000]}")
+
         # Проверяем ошибку внутри ответа
         if isinstance(result, dict) and "Table" in result:
             table = result["Table"]

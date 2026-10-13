@@ -38,11 +38,20 @@ class Settings(BaseSettings):
     embedding_dim: int = 1024
 
     # === SupplierPortal / AlwaysOn API ===
-    supplier_portal_url: str = "https://172.29.5.40:8443"
-    supplier_portal_service_number: str = ""
+    # === SupplierPortal / AlwaysOn API ===
+    supplier_portal_env: str = "dev"   # dev | prod
+
+    # Dev
+    supplier_portal_url_dev: str = "https://rest.eurotorg.by/10195"
+    supplier_portal_service_number_dev: str = ""
+
+    # Prod
+    supplier_portal_url_prod: str = "https://rest.eurotorg.by/10196"
+    supplier_portal_service_number_prod: str = ""
+
+    # Общие
     supplier_portal_verify_ssl: bool = False
     supplier_portal_timeout: int = 30
-
     # === HF ===
     hf_token: str = ""
 
@@ -52,5 +61,19 @@ class Settings(BaseSettings):
     processed_dir: str = "data/processed"
     logs_dir: str = "logs"
 
+    # === Производные (вычисляются) ===
+    @property
+    def supplier_portal_url(self) -> str:
+        """URL SupplierPortal в зависимости от режима."""
+        if self.supplier_portal_env == "prod":
+            return self.supplier_portal_url_prod
+        return self.supplier_portal_url_dev
+
+    @property
+    def supplier_portal_service_number(self) -> str:
+        """ServiceNumber в зависимости от режима."""
+        if self.supplier_portal_env == "prod":
+            return self.supplier_portal_service_number_prod
+        return self.supplier_portal_service_number_dev
 
 settings = Settings()

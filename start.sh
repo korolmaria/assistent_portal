@@ -12,9 +12,11 @@
 #   ./start.sh              — полный запуск
 #   ./start.sh --no-wait    — без ожидания готовности vLLM
 #   ./start.sh --fast       — только FastAPI (без контейнеров)
+#   ./start.sh --ingest     — после запуска загрузить новые документы
+#   ./start.sh --help       — показать справку
 # ============================================================
 
-set -e  # выход при ошибке
+set -e
 
 # === Настройки ===
 PROJECT_DIR="/root/assistant-eportal"
@@ -22,17 +24,37 @@ API_PORT=8080
 VLLM_VL_PORT=8000
 VLLM_TEXT_PORT=8010
 TRITON_PORT=8001
-WAIT_TIMEOUT=300   # 5 минут максимум на загрузку моделей
-WAIT_INTERVAL=10   # проверять каждые 10 секунд
+WAIT_TIMEOUT=300
+WAIT_INTERVAL=10
 
 # === Аргументы ===
 SKIP_WAIT=false
 FAST_MODE=false
+RUN_INGEST=false
+
+show_help() {
+    echo ""
+    echo "Использование: ./start.sh [опции]"
+    echo ""
+    echo "Опции:"
+    echo "  --ingest     После запуска загрузить новые документы из data/uploads/"
+    echo "  --no-wait    Не ждать готовности vLLM (3-5 минут)"
+    echo "  --fast       Только FastAPI (Docker-контейнеры не трогать)"
+    echo "  --help       Показать эту справку"
+    echo ""
+    exit 0
+}
 
 for arg in "$@"; do
     case $arg in
         --no-wait) SKIP_WAIT=true ;;
         --fast)    FAST_MODE=true ;;
+        --ingest)  RUN_INGEST=true ;;
+        --help)    show_help ;;
+        *)
+            echo "⚠️  Неизвестный аргумент: $arg"
+            show_help
+            ;;
     esac
 done
 
@@ -73,12 +95,12 @@ fi
 # === 3. Ожидание готовности vLLM ===
 if [ "$SKIP_WAIT" = false ] && [ "$FAST_MODE" = false ]; then
     echo ""
-    echo "⏳ Ожидание готовности vLLM VL (порт $VLLM_VL_PORT)..."
+    echo "⏳ Ожидание vLLM VL (порт $VLLM_VL_PORT)..."
 
     elapsed=0
     while [ $elapsed -lt $WAIT_TIMEOUT ]; do
         if curl -s -f "http://localhost:$VLLM_VL_PORT/v1/models" > /dev/null 2>&1; then
-            echo "✅ vLLM VL готов (за ${elapsed}с)"
+            echo "✅ vLLM VL готов (${elapsed}с)"
             break
         fi
         sleep $WAIT_INTERVAL
@@ -87,17 +109,17 @@ if [ "$SKIP_WAIT" = false ] && [ "$FAST_MODE" = false ]; then
     done
 
     if [ $elapsed -ge $WAIT_TIMEOUT ]; then
-        echo "⚠️  vLLM VL не готов за ${WAIT_TIMEOUT}с — продолжаем, но проверьте логи:"
+        echo "⚠️  vLLM VL не готов за ${WAIT_TIMEOUT}с. Логи:"
         echo "   docker compose logs vllm-qwen-vl"
     fi
 
     echo ""
-    echo "⏳ Ожидание готовности vLLM Text (порт $VLLM_TEXT_PORT)..."
+    echo "⏳ Ожидание vLLM Text (порт $VLLM_TEXT_PORT)..."
 
     elapsed=0
     while [ $elapsed -lt $WAIT_TIMEOUT ]; do
         if curl -s -f "http://localhost:$VLLM_TEXT_PORT/v1/models" > /dev/null 2>&1; then
-            echo "✅ vLLM Text готов (за ${elapsed}с)"
+            echo "✅ vLLM Text готов (${elapsed}с)"
             break
         fi
         sleep $WAIT_INTERVAL
@@ -106,12 +128,12 @@ if [ "$SKIP_WAIT" = false ] && [ "$FAST_MODE" = false ]; then
     done
 
     echo ""
-    echo "⏳ Ожидание готовности Triton (порт $TRITON_PORT)..."
+    echo "⏳ Ожидание Triton (порт $TRITON_PORT)..."
 
     elapsed=0
     while [ $elapsed -lt $WAIT_TIMEOUT ]; do
         if curl -s -f "http://localhost:$TRITON_PORT/v2/health/ready" > /dev/null 2>&1; then
-            echo "✅ Triton готов (за ${elapsed}с)"
+            echo "✅ Triton готов (${elapsed}с)"
             break
         fi
         sleep $WAIT_INTERVAL
@@ -124,10 +146,8 @@ fi
 echo ""
 echo "🚀 Запуск FastAPI..."
 
-# Убеждаемся, что нет старого процесса
 pkill -f "uvicorn app.main" 2>/dev/null || true
 
-# Запускаем через systemd (если настроен)
 if systemctl is-enabled assistant-api > /dev/null 2>&1; then
     echo "   → через systemd"
     sudo systemctl restart assistant-api
@@ -162,7 +182,25 @@ if [ $elapsed -ge 60 ]; then
     echo "   tail -30 /tmp/api.log"
 fi
 
-# === 6. Итог ===
+# === 6. Ingest документов (опционально) ===
+if [ "$RUN_INGEST" = true ]; then
+    echo ""
+    echo "════════════════════════════════════════════════════════════"
+    echo "📥 Ingest документов"
+    echo "════════════════════════════════════════════════════════════"
+    echo ""
+    echo "⚠️  Будут обработаны только НОВЫЕ документы."
+    echo "   Уже загруженные пропускаются (журнал .ingest_state.json)."
+    echo ""
+    read -p "Продолжить? (y/N): " confirm
+    if [ "$confirm" = "y" ] || [ "$confirm" = "Y" ]; then
+        python -m scripts.ingest_docs --dir data/uploads/
+    else
+        echo "Отменено."
+    fi
+fi
+
+# === 7. Итог ===
 echo ""
 echo "════════════════════════════════════════════════════════════"
 echo "✅ Запуск завершён"
@@ -183,4 +221,5 @@ echo "   sudo journalctl -u assistant-api -f  — логи API"
 echo "   tail -30 /tmp/api.log                — логи (если nohup)"
 echo ""
 echo "🔄 Перезапуск API после правок:  ./restart.sh"
+echo "📊 Проверка состояния:           ./status.sh"
 echo ""

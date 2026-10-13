@@ -41,11 +41,24 @@ app.add_middleware(
 def _extract_jwt(authorization: str | None) -> str:
     """Извлекает JWT из заголовка Authorization: Bearer xxx."""
     if not authorization:
+        logger.warning("[auth] Authorization header ОТСУТСТВУЕТ")
         return ""
+
+    # Логируем, что пришло (первые 80 символов — безопасно)
+    logger.info(f"[auth] Authorization: {authorization[:80]}...")
+
     parts = authorization.split()
     if len(parts) == 2 and parts[0].lower() == "bearer":
-        return parts[1]
+        jwt = parts[1]
+        logger.info(
+            f"[auth] JWT извлечён: {jwt[:40]}... "
+            f"(длина: {len(jwt)} символов)"
+        )
+        return jwt
+
+    logger.warning(f"[auth] Нестандартный формат: {authorization[:80]}")
     return authorization
+
 
 
 def _sse_event(data: dict) -> str:
@@ -196,6 +209,29 @@ async def health():
         qdrant=qdrant_ok,
         neo4j=False,
     )
+
+# ==========================================================================
+# Проверка JWT (для отладки)
+# ==========================================================================
+@app.get("/api/v1/whoami")
+async def whoami(authorization: str | None = Header(default=None)):
+    """
+    Проверка: приходит ли JWT на бэк.
+    Показывает заголовок Authorization без раскрытия полного токена.
+    """
+    jwt = _extract_jwt(authorization)
+
+    return {
+        "authorization_header_present": authorization is not None,
+        "authorization_header_preview": (
+            authorization[:80] + "..." if authorization else None
+        ),
+        "jwt_extracted": jwt[:40] + "..." if jwt else None,
+        "jwt_length": len(jwt),
+        "jwt_first_20": jwt[:20] if jwt else None,
+        "jwt_last_20": jwt[-20:] if len(jwt) > 20 else None,
+    }
+
 
 
 # ==========================================================================
