@@ -99,6 +99,18 @@ class SupplierPortalClient:
             jwt=jwt,
         )
 
+    async def get_order_buy(
+        self,
+        filters: dict[str, Any],
+        jwt: str,
+    ) -> dict[str, Any]:
+        """Содержимое заказов (позиции/строки)."""
+        return await self.call(
+            method="SupplierPortal.GetOrderBuy",
+            data=filters,
+            jwt=jwt,
+        )
+
 
 # Singleton
 supplier_portal = SupplierPortalClient()

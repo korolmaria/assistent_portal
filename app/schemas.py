@@ -95,7 +95,7 @@ class DisplayBlock(BaseModel):
       - table → list[OrderCardData]
       - text  → None (только extra)
     """
-    type: Literal["card", "info", "table", "text"]
+    type: Literal["card", "info", "table", "text", "order_items_table"]
     data: Any = None
     extra: dict[str, Any] | None = None
 

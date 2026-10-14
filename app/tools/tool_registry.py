@@ -36,8 +36,8 @@ BRAND_IDS: dict[str, int] = {
 #   Выполнен – 90
 ORDER_STATUS_IDS: dict[str, int] = {
     "на сайте": 10,
-    "автоподтверждён": 48, "автоподтвержден": 48,
-    "подтверждён": 50, "подтвержден": 50,
+    "автоподтверждён": 48,
+    "подтверждён": 50,
     "выполнен": 90,
 }
 
@@ -272,6 +272,117 @@ def parse_orders_response(raw: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 # ==========================================================================
+# Хелперы для приведения типов (API отдаёт всё строками)
+# ==========================================================================
+def _to_float(val) -> float | None:
+    """'1.87' → 1.87, '' → None, None → None."""
+    if val is None or val == "":
+        return None
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return None
+
+
+def _to_int(val) -> int | None:
+    """'50' → 50, '' → None, None → None."""
+    if val is None or val == "":
+        return None
+    try:
+        return int(float(val))
+    except (ValueError, TypeError):
+        return None
+
+
+# ==========================================================================
+# Парсер ответа GetOrderBuy (содержимое заказа)
+# ==========================================================================
+def parse_order_items_response(raw: dict[str, Any]) -> dict[str, Any]:
+    """
+    Ответ GetOrderBuy → {"items": [...], "amount": int, "page_qty": int}.
+
+    Статус каждой позиции вычисляется через compute_order_status —
+    та же логика, что и в GetOrderBuyGroup.
+    """
+    table = raw.get("Table", [])
+    if not isinstance(table, list):
+        table = []
+
+    items: list[dict[str, Any]] = []
+    amount = 0
+    page_qty = 0
+
+    for row in table:
+        if not isinstance(row, dict):
+            continue
+        if "OrderBuyId" not in row:
+            continue
+
+        if not amount:
+            amount = int(row.get("Amount") or 0)
+            page_qty = int(row.get("PageQty") or 0)
+
+        status_text, status_type = compute_order_status(
+            checkx=row.get("Checkx"),
+            checkx_fact=row.get("CheckxFact"),
+            is_revised=row.get("IsRevised"),
+            is_auto=row.get("IsAuto"),
+        )
+
+        items.append({
+            "order_id": _to_int(row.get("OrderBuyGroupId")),
+            "order_buy_id": _to_int(row.get("OrderBuyId")),
+            "line_number": _to_int(row.get("LineNumber")),
+            "row_number": _to_int(row.get("RowNumber")),
+            "goods_id": _to_int(row.get("GoodsId")),
+            "goods_name": row.get("GoodsName"),
+            "barcode": row.get("Barcode1"),
+            "brand": row.get("BrandName"),
+            "warehouse_id": _to_int(row.get("WarehouseId")),
+            "gln_warehouse": _to_int(row.get("GLNWarehouse")),
+            "address": row.get("DepartmentAddress"),
+            "status": status_text,
+            "status_type": status_type,
+            "checkx": _to_int(row.get("Checkx")),
+            "checkx_fact": _to_int(row.get("CheckxFact")),
+            "is_revised": _to_int(row.get("IsRevised")),
+            "is_auto": _to_int(row.get("IsAuto")),
+            "quantity_order": _to_float(row.get("QuantityOrder")),
+            "quantity_supplier": _to_float(row.get("QuantitySupplier")),
+            "quantity_add2": _to_float(row.get("QuantityAdd2")),
+            "dif_quantity": _to_float(row.get("DifQuantity")),
+            "limit_quantity": _to_float(row.get("LimitQuantity")),
+            "quantity_in_pack": _to_float(row.get("QuantityInPack")),
+            "quantity_multiple": _to_float(row.get("QuantityMultiple")),
+            "delivery_quantity_pack_min": _to_float(row.get("DeliveryQuantityPackMin")),
+            "quantity_order_promo": _to_float(row.get("QuantityOrderPromo")),
+            "price": _to_float(row.get("Price")),
+            "price2": _to_float(row.get("Price2")),
+            "first_x": _to_float(row.get("FirstX")),
+            "tax_id": _to_int(row.get("TaxId")),
+            "order_sum": _to_float(row.get("OrderSum")),
+            "sum2_add2": _to_float(row.get("Sum2Add2")),
+            "is_promo": _to_int(row.get("IsPromo")),
+            "plan_promo": row.get("PlanPromo"),
+            "is_cross_dock": _to_int(row.get("IsCrossDock")),
+            "is_processed": _to_int(row.get("IsProcessed")),
+            "control_weight": _to_int(row.get("ControlWeight")),
+            "info": row.get("Info"),
+            "group_info_name": row.get("OrderBuyGroupInfoName"),
+            "datex": row.get("Datex"),
+            "shipment_date_last": row.get("ShipmentDateLast"),
+        })
+
+    logger.info(
+        f"[tool_registry] parsed {len(items)} items, "
+        f"amount={amount}, page_qty={page_qty}"
+    )
+    return {"items": items, "amount": amount, "page_qty": page_qty}
+
+
+
+
+# ==========================================================================
 # Реестр инструментов
 # ==========================================================================
 TOOLS: list[dict[str, Any]] = [
@@ -281,28 +392,34 @@ TOOLS: list[dict[str, Any]] = [
             "function": {
                 "name": "get_supplier_orders",
                 "description": (
-                    "Получить список заказов поставщика из SupplierPortal. "
-                    "Поддерживает фильтры: номер заказа, период поставки, "
-                    "период создания, статус заказа, статус обработки, бренд, "
-                    "склад, область, район, город. "
-                    "Если фильтры не заданы — вернёт все заказы за последние 3-6 месяцев.\n\n"
-                    "СПРАВОЧНИКИ ID (используй эти значения):\n"
+                    "Получить СПИСОК ЗАКАЗОВ поставщика. "
+                    "Возвращает карточки заказов (номер, статус, сумма, склад, "
+                    "контрагент, адрес), БЕЗ списка товаров внутри.\n\n"
+
+                    "✅ ИСПОЛЬЗУЙ КОГДА пользователь спрашивает про ЗАКАЗЫ:\n"
+                    "• «покажи мои заказы» / «покажи заказы»\n"
+                    "• «заказы за сентябрь» / «заказы за последнюю неделю»\n"
+                    "• «подтверждённые заказы» / «необработанные заказы»\n"
+                    "• «заказы по бренду Хит» / «заказы по Минску»\n"
+                    "• «сколько заказов за сентябрь»\n"
+                    "• «покажи заказ 98010225» (без слов «товары», «позиции», "
+                    "«содержимое»)\n"
+                    "• «какой статус у заказа 98010225»\n"
+                    "• «какая сумма у заказа 98010225»\n\n"
+
+                    "❌ НЕ ИСПОЛЬЗУЙ ЕСЛИ в запросе есть слова «товары», "
+                    "«позиции», «артикул», «содержимое», «что заказано», "
+                    "«какие товары» — для этого есть get_order_items.\n\n"
+
+                    "СПРАВОЧНИКИ ID:\n"
                     "• Бренды (brand_ids): 2=Хит, 3=Грошык, 6=Евроопт\n"
-                    "• Статусы заказа (checkx): 10=На сайте, 48=Автоподтверждён, "
+                    "• Статусы (checkx): 10=На сайте, 48=Автоподтверждён, "
                     "50=Подтверждён, 90=Выполнен\n"
-                    "• Статус обработки (is_processed): 0=не обработан, 1=обработан\n"
+                    "• Обработка (is_processed): 0=не обработан, 1=обработан\n"
                     "• Области (region_ids): 70=Брестская обл, 71=Брест, "
                     "72=Витебская обл, 73=Витебск, 74=Гомельская обл, 75=Гомель, "
                     "76=Гродненская обл, 77=Гродно, 78=Минск, 79=Минская обл, "
-                    "80=Могилевская обл, 81=Могилев\n\n"
-                    "ПРИМЕРЫ ЗАПРОСОВ:\n"
-                    "• «покажи заказ 56» → order_ids: [56]\n"
-                    "• «заказы 1 и 2» → order_ids: [1, 2]\n"
-                    "• «подтверждённые заказы» → checkx: [50]\n"
-                    "• «необработанные» → is_processed: 0\n"
-                    "• «заказы по бренду Хит» → brand_ids: [2]\n"
-                    "• «заказы по Минску» → region_ids: [78]\n"
-                    "• «за сентябрь» → date_begin: 2026-09-01, date_end: 2026-09-30"
+                    "80=Могилевская обл, 81=Могилев"
                 ),
                 "parameters": {
                     "type": "object",
@@ -401,14 +518,106 @@ TOOLS: list[dict[str, Any]] = [
         "api_method": "SupplierPortal.GetOrderBuyGroup",
         "parser": parse_orders_response,
     },
+    {
+        "spec": {
+            "type": "function",
+            "function": {
+                "name": "get_order_items",
+                "description": (
+                    "Получить СПИСОК ТОВАРОВ (позиций) ВНУТРИ заказов "
+                    "поставщика. Возвращает строки заказа: артикул, "
+                    "наименование, штрихкод, количество, цены, суммы, статус.\n\n"
+
+                    "✅ ИСПОЛЬЗУЙ КОГДА пользователь спрашивает про ТОВАРЫ в ЗАКАЗЕ или ЗАКАЗАХ "
+                    "внутри заказа:\n"
+                    "• «какие товары в заказе X»\n"
+                    "• «какие товары заказаны в заказе X»\n"
+                    "• «покажи содержимое заказа X»\n"
+                    "• «что заказано по заказу X»\n"
+                    "• «позиции заказа X» / «покажи позиции заказа X»\n"
+                    "• «товары с артикулом N в заказе X»\n"
+                    "• «сколько товара N в заказе X»\n"
+                    "• «есть ли товар N в заказе X»\n\n"
+
+                    "❌ НЕ ИСПОЛЬЗУЙ ЕСЛИ пользователь хочет СПИСОК САМИХ "
+                    "ЗАКАЗОВ (без товаров) — для этого есть get_supplier_orders.\n\n"
+
+                    "ВАЖНО: параметр order_ids ОБЯЗАТЕЛЕН. Если пользователь "
+                    "не назвал номер заказа — сначала вызови get_supplier_orders, "
+                    "чтобы найти нужный заказ, потом get_order_items.\n\n"
+
+                    "Можно запросить сразу НЕСКОЛЬКО заказов — "
+                    "передай их ID массивом в order_ids."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "order_ids": {
+                            "type": "array",
+                            "items": {"type": "integer"},
+                            "description": (
+                                "ID заказов (OrderBuyGroupId). "
+                                "Например, «товары заказа 98010205» → [98010205]."
+                            ),
+                        },
+                        "goods_ids": {
+                            "type": "array",
+                            "items": {"type": "integer"},
+                            "description": "Артикулы товаров (GoodsId)",
+                        },
+                        "goods_name": {
+                            "type": "string",
+                            "description": "Краткое наименование товара",
+                        },
+                        "barcodes": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Штрихкоды товаров (Barcode1)",
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Максимум строк на странице",
+                            "default": 30,
+                        },
+                        "page_number": {
+                            "type": "integer",
+                            "description": "Номер страницы",
+                            "default": 1,
+                        },
+                        "sorting_field": {
+                            "type": "string",
+                            "description": "Поле для сортировки",
+                        },
+                        "sorting_param": {
+                            "type": "integer",
+                            "description": "0 — по возрастанию, 1 — по убыванию",
+                            "enum": [0, 1],
+                        },
+                    },
+                    "required": ["order_ids"],
+                },
+            },
+        },
+        "api_method": "SupplierPortal.GetOrderBuy",
+        "parser": parse_order_items_response,
+    },
 ]
 
 
 # ==========================================================================
-# Маппинг параметров LLM → API
+# Маппинг параметров LLM → API (диспетчер по имени tool)
 # ==========================================================================
-def params_to_api(params: dict[str, Any]) -> dict[str, Any]:
-    """LLM даёт snake_case, API ждёт CamelCase. Мапим."""
+def params_to_api(params: dict[str, Any], tool_name: str) -> dict[str, Any]:
+    """LLM даёт snake_case, API ждёт CamelCase. Диспетчер по имени tool."""
+    if tool_name == "get_supplier_orders":
+        return _params_to_api_orders(params)
+    if tool_name == "get_order_items":
+        return _params_to_api_items(params)
+    raise ValueError(f"Нет маппера для tool: {tool_name}")
+
+
+def _params_to_api_orders(params: dict[str, Any]) -> dict[str, Any]:
+    """Маппер для get_supplier_orders (GetOrderBuyGroup)."""
     api_data: dict[str, Any] = {
         "OrderBuyGroupId": params.get("order_ids", []),
         "GoodsId": [],
@@ -424,7 +633,6 @@ def params_to_api(params: dict[str, Any]) -> dict[str, Any]:
         "GroupParamLevel": [],
         "Language": 1,
     }
-
     if params.get("date_begin"):
         api_data["DateBegin"] = params["date_begin"]
     if params.get("date_end"):
@@ -435,7 +643,25 @@ def params_to_api(params: dict[str, Any]) -> dict[str, Any]:
         api_data["TTTimeEnd"] = params["tt_time_end"]
     if params.get("is_processed") is not None:
         api_data["IsProcessed"] = params["is_processed"]
+    return api_data
 
+
+def _params_to_api_items(params: dict[str, Any]) -> dict[str, Any]:
+    """Маппер для get_order_items (GetOrderBuy)."""
+    api_data: dict[str, Any] = {
+        "OrderBuyGroupId": params.get("order_ids", []),
+        "GoodsId": params.get("goods_ids", []),
+        "Barcode1": params.get("barcodes", []),
+        "PageNumber": params.get("page_number", 1),
+        "Limit": params.get("limit", 30),
+        "Language": 1,
+    }
+    if params.get("goods_name"):
+        api_data["GoodsName"] = params["goods_name"]
+    if params.get("sorting_field"):
+        api_data["SortingField"] = params["sorting_field"]
+    if params.get("sorting_param") is not None:
+        api_data["SortingParam"] = params["sorting_param"]
     return api_data
 
 

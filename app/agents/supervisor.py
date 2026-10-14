@@ -8,6 +8,9 @@ Supervisor — оркестратор мультиагентной систем�
 - rag+tool: комбинированный (правила + данные)
 
 Возвращает генератор SSE-событий для стриминга на фронт.
+
+ВАЖНО: LLM-роутер только КЛАССИФИЦИРУЕТ запрос (rag / tool / rag+tool).
+Он НЕ переформулирует его — оригинальный query идёт дальше в агенты.
 """
 import json
 from typing import Any, AsyncGenerator
@@ -27,12 +30,12 @@ ROUTER_SYSTEM_PROMPT = """Ты — маршрутизатор запросов �
 
 Определи, что нужно для ответа:
 - rag: информация из документов (инструкции, регламенты, правила, методы API, описания)
-- tool: данные из API (список заказов, статусы, суммы, конкретные значения)
+- tool: данные из API (список заказов, статусы, суммы, товары в заказе, конкретные значения)
 - rag+tool: И правила/инструкции, И данные из API (комбинированный)
 
 ПРАВИЛА:
 1. Запрос про **как сделать / как работает / какой метод / инструкция / описание / технически** → **rag**
-2. Запрос про **покажи / найди / сколько / какие** (данные из системы) → **tool**
+2. Запрос про **покажи / найди / сколько / какие / есть ли / был ли** (данные из системы) → **tool**
 3. **КОМБИНИРОВАННЫЕ ЗАПРОСЫ** — когда нужны И правила, И данные.
    ⚠️ КЛЮЧЕВОЙ КРИТЕРИЙ: есть ли **КОНКРЕТНЫЙ ФИЛЬТР** для данных?
 
@@ -74,8 +77,11 @@ ROUTER_SYSTEM_PROMPT = """Ты — маршрутизатор запросов �
 - «дай данные по заказу 56» → tool
 - «покажи заказ 98010205» → tool
 - «сколько заказов за сентябрь» → tool
+- «какие товары в заказе 98010225» → tool
+- «заказывали ли молоко в заказе 98010225» → tool
+- «какой статус у заказа 98010205» → tool
 
-# Комбинированный rag+tool (есть фильтр + вопрос про правила/данные)
+# Комбинированный rag+tool (есть фильтр + вопрос про правила)
 - «могу ли отменить заказ 98010205» → rag+tool
 - «можно ли подтвердить заказ 98010205» → rag+tool
 - «могу ли подтвердить заказы за сентябрь?» → rag+tool
@@ -86,8 +92,7 @@ ROUTER_SYSTEM_PROMPT = """Ты — маршрутизатор запросов �
 Формат ответа (строго JSON, без markdown):
 {
   "route": "rag" | "tool" | "rag+tool",
-  "reason": "краткое объяснение (1 предложение)",
-  "tool_query": "переформулированный запрос для API (только если route включает tool)"
+  "reason": "краткое объяснение (1 предложение)"
 }
 """
 
@@ -95,6 +100,12 @@ ROUTER_SYSTEM_PROMPT = """Ты — маршрутизатор запросов �
 async def decide_route(query: str) -> dict[str, str]:
     """
     LLM решает, какой маршрут использовать.
+
+    ВАЖНО: роутер только КЛАССИФИЦИРУЕТ запрос.
+    Он НЕ переформулирует его — оригинальный query идёт дальше в агенты.
+
+    Возвращает:
+        {"route": "rag" | "tool" | "rag+tool", "reason": "..."}
     """
     prompt = f"""Запрос: {query}
 
@@ -125,12 +136,11 @@ async def decide_route(query: str) -> dict[str, str]:
         return {
             "route": route,
             "reason": result.get("reason", ""),
-            "tool_query": result.get("tool_query", query),
         }
 
     except Exception as e:
         logger.warning(f"[supervisor] ошибка роутинга: {e}, fallback → rag")
-        return {"route": "rag", "reason": "fallback", "tool_query": query}
+        return {"route": "rag", "reason": "fallback"}
 
 
 # ==========================================================================
@@ -143,6 +153,12 @@ async def run_supervisor(
 ) -> AsyncGenerator[dict[str, Any], None]:
     """
     Главный генератор SSE-событий.
+
+    ВАЖНО: query — оригинальный запрос пользователя. Он идёт:
+    - в decide_route (для классификации)
+    - в rag_search (для поиска по документам)
+    - в run_tool_agent (для выбора tool и извлечения параметров)
+    - в synthesize (для формирования ответа)
     """
     try:
         # 1. Определяем маршрут
@@ -150,11 +166,11 @@ async def run_supervisor(
             decision = await decide_route(query)
             chosen_route = decision["route"]
             reason = decision["reason"]
-            tool_query = decision["tool_query"]
         else:
             chosen_route = route
             reason = f"выбрано пользователем: {route}"
-            tool_query = query
+
+        logger.info(f"[supervisor] chosen_route={chosen_route}, query={query!r}")
 
         yield {"type": "route", "route": chosen_route, "reason": reason}
 
@@ -183,8 +199,9 @@ async def run_supervisor(
         if chosen_route in ("tool", "rag+tool"):
             yield {"type": "step", "message": "📊 Запрос к SupplierPortal..."}
             try:
+                # ⚠️ Передаём ОРИГИНАЛЬНЫЙ query, без переформулировок
                 text, display_block, tool_meta = await run_tool_agent(
-                    query=tool_query,
+                    query=query,
                     jwt=jwt,
                 )
                 tool_name = "get_supplier_orders"
@@ -200,7 +217,7 @@ async def run_supervisor(
                 logger.info(f"[supervisor] Tool: {text[:100]}")
                 yield {"type": "step", "message": f"   {text[:100]}"}
             except Exception as e:
-                logger.error(f"[supervisor] Tool-ошибка: {e}")
+                logger.exception(f"[supervisor] Tool-ошибка: {e}")
                 yield {"type": "step", "message": f"   ⚠️ ошибка API: {e}"}
 
         # 3. Synthesis
