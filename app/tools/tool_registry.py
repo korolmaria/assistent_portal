@@ -358,7 +358,7 @@ def parse_order_items_response(raw: dict[str, Any]) -> dict[str, Any]:
             "quantity_order_promo": _to_float(row.get("QuantityOrderPromo")),
             "price": _to_float(row.get("Price")),
             "price2": _to_float(row.get("Price2")),
-            "first_x": _to_float(row.get("FirstX")),
+            "first_x": _to_float(row.get("Firstx")),
             "tax_id": _to_int(row.get("TaxId")),
             "order_sum": _to_float(row.get("OrderSum")),
             "sum2_add2": _to_float(row.get("Sum2Add2")),

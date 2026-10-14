@@ -221,13 +221,36 @@ async def run_supervisor(
                 yield {"type": "step", "message": f"   ⚠️ ошибка API: {e}"}
 
         # 3. Synthesis
+        #
+        # ВАЖНО: для tool-запросов с display текст УЖЕ готов в tool-агенте
+        # (build_items_human_summary / build_human_summary). НЕ перегенерируем
+        # его через LLM — иначе модель может галлюцинировать числа и позиции.
         yield {"type": "step", "message": "✍️ Генерация ответа..."}
 
-        answer, final_sources, synth_tools = await synthesize(
-            query=query,
-            rag_chunks=rag_chunks,
-            tool_results=tool_results,
-        )
+        tool_text = ""
+        for tr in tool_results:
+            if tr.get("text"):
+                tool_text = tr["text"]
+                break
+
+        has_display = display_block is not None
+        has_rag = bool(rag_chunks)
+
+        if has_display and not has_rag and tool_text:
+            # Используем готовый текст tool-агента как есть
+            logger.info(
+                f"[supervisor] используем готовый text tool-агента "
+                f"({len(tool_text)} симв.), synthesize пропускаем"
+            )
+            answer = tool_text
+            final_sources = []
+            synth_tools = tools_used
+        else:
+            answer, final_sources, synth_tools = await synthesize(
+                query=query,
+                rag_chunks=rag_chunks,
+                tool_results=tool_results,
+            )
 
         all_sources = rag_sources or final_sources
 

@@ -273,7 +273,7 @@ async def synthesize(
     # === max_tokens для tool+display ===
     actual_max_tokens = max_tokens
     if has_tool and not has_rag and has_display:
-        actual_max_tokens = 300
+        actual_max_tokens = 1000
 
     logger.info(
         f"[synthesis] Qwen3-8B: {len(rag_chunks)} rag, "
