@@ -1,15 +1,5 @@
 """
 Synthesis-агент: собирает финальный ответ через Qwen3-8B.
-
-Поддерживает:
-- только RAG (документы)
-- только Tool (данные из API)
-- комбинированный (RAG + Tool)
-
-Особенности:
-- Нормализация цитат [doc_id:pN]
-- Приоритет технических деталей (методы API, URL, JSON-поля)
-- Для Tool-запросов с display — ответ на вопрос на основе данных
 """
 import json
 import re
@@ -17,19 +7,17 @@ from typing import Any
 
 from loguru import logger
 
+from app.agents.memory import format_history, format_summary
 from app.llm.vllm_client import vllm_client
-from app.schemas import Source
+from app.schemas import ChatHistoryItem, Source
 
 
-# ==========================================================================
-# Системный промпт
-# ==========================================================================
 SYSTEM_PROMPT = """Ты — ИИ-помощник для поставщиков торговой сети «Евроторг».
-Твоя задача — отвечать на вопросы пользователя, используя предоставленный контекст.
+Твоя задача — отвечать на вопросы пользователя, используя предоставленный контекст и историю диалога.
 
 ПРАВИЛА ОТВЕТА:
-1. Отвечай ТОЛЬКО на основе контекста. Не выдумывай.
-2. Если в контексте нет ответа — так и скажи: «В предоставленных данных нет ответа».
+1. Отвечай на основе КОНТЕКСТА или ПАМЯТИ ДИАЛОГА (истории). Не выдумывай факты, которых нет ни там, ни там.
+2. Если ответа нет ни в контексте, ни в истории диалога — так и скажи: «В предоставленных данных нет ответа».
 3. Пиши кратко, по делу, на русском языке.
 4. Если ответ — процедура/шаги, оформляй списком.
 5. Если ответ — таблица или числовые данные, приводи точно.
@@ -41,7 +29,7 @@ SYSTEM_PROMPT = """Ты — ИИ-помощник для поставщиков 
    - НЕ пиши "| стр. N", "стр. N", "doc_id:"
    - Правильно: [trebovaniya_10fc:p1]
    - Неправильно: [doc_id:trebovaniya_10fc | стр. 1]
-   - Для данных из API: без ссылок вообще.
+   - Для данных из API и для ответов из истории диалога: без ссылок вообще.
 
 7. Если контекст содержит И правила из документов, И данные из API:
    - Сначала объясни правило/регламент со ссылкой
@@ -56,16 +44,31 @@ SYSTEM_PROMPT = """Ты — ИИ-помощник для поставщиков 
      • HTTP-методы (POST, GET)
      • статусы (10, 50, 60, 90)
      • названия кнопок интерфейса («Подтвердить поставку»)
-
    НЕ заменяй технические термины на общие слова («метод», «запрос», «API»).
 
 9. ДАННЫЕ ИЗ API (tool-запросы):
    Если тебе даны данные о заказах (в карточке/таблице) — ОТВЕЧАЙ НА ВОПРОС,
-   используя эти данные. Не пересказывай ВСЮ карточку.
-   • «Какой статус?» → «Статус — Подтверждён (код 50).»
-   • «Какая сумма?» → «Сумма — 55.80 руб.»
-   • «Расскажи о заказе» → краткая сводка: номер, поставщик, сумма, статус, дата.
-   Максимум 2-3 предложения.
+   используя эти данные. 
+   
+   ⚠️ ГЛАВНОЕ ПРАВИЛО: Сначала пойми, ЧТО СПРАШИВАЕТ пользователь, и ответь ИМЕННО НА ЭТО.
+   • Если спрашивают «могу ли подтвердить / отменить / изменить?» — 
+     ответь «Да, можете» или «Нет, нельзя» (на основе статуса из данных).
+     НЕ пиши про сумму, если спросили про возможность.
+   • Если спрашивают «какая сумма / статус / дата?» — 
+     ответь конкретным значением. Начни с ответа, не пиши «Какая сумма?».
+   • Если спрашивают «есть ли товар?» — 
+     ответь «Да, есть...» или «Нет, не найдено».
+   • Если вопрос общий («расскажи», «покажи») — дай краткую сводку.
+   
+   • НЕ пересказывай ВСЕ поля таблицы. Скажи главное.
+   • НИКОГДА не дублируй вопрос пользователя в ответе (не пиши «Какая сумма?» перед суммой).
+   • Максимум 2-3 предложения.
+
+10. ПАМЯТЬ ДИАЛОГА (ОЧЕНЬ ВАЖНО):
+    В начале промпта есть блоки «КРАТКОЕ СОДЕРЖАНИЕ» и/или «ПОСЛЕДНИЕ СООБЩЕНИЯ».
+    Если пользователь задаёт вопрос о фактах ИЗ ДИАЛОГА (например, «как меня зовут?», 
+    «что я спрашивал ранее?»), ОТВЕЧАЙ ИЗ ИСТОРИИ. 
+    Если вопрос про инструкции/заказы — ищи факты в блоке КОНТЕКСТ.
 
 СТИЛЬ:
 - Профессиональный, деловой.
@@ -74,13 +77,7 @@ SYSTEM_PROMPT = """Ты — ИИ-помощник для поставщиков 
 """
 
 
-# ==========================================================================
-# Нормализация цитат
-# ==========================================================================
 def normalize_citations(text: str) -> str:
-    """
-    Приводит все форматы цитат к [doc_id:pN].
-    """
     text = re.sub(
         r"\[doc_id:([a-zA-Z0-9_\-]+)\s*[|:]\s*стр\.\s*(\d+)\]",
         r"[\1:p\2]",
@@ -115,45 +112,90 @@ def normalize_citations(text: str) -> str:
 
 
 def extract_citations(text: str) -> list[str]:
-    """Вытаскивает цитаты [doc_id:pN] из ответа."""
     pattern = r"\[([a-zA-Z0-9_\-]+):p(\d+)\]"
     return [m.group(0) for m in re.finditer(pattern, text)]
 
 
 def clean_citations_for_display(text: str) -> str:
-    """Убирает все цитаты из текста (для отображения без них)."""
     return re.sub(r"\s*\[[a-zA-Z0-9_\-]+(?::p\d+)?\]", "", text).strip()
 
 
-# ==========================================================================
-# Главная функция
-# ==========================================================================
 async def synthesize(
     query: str,
     rag_chunks: list[dict[str, Any]] | None = None,
     tool_results: list[dict[str, Any]] | None = None,
     extra_text: str | None = None,
     max_tokens: int = 2500,
+    history: list[ChatHistoryItem] | None = None,
+    summary: str | None = None,
 ) -> tuple[str, list[Source], list[str]]:
-    """
-    Собирает финальный ответ.
-    """
     rag_chunks = rag_chunks or []
     tool_results = tool_results or []
+    q_lower = query.lower()
+
+    # === 1. Мета-вопросы о прошлом диалоге ===
+    if any(kw in q_lower for kw in ["про какой заказ", "о чем я", "о чём я", "что я спрашивал", "что ты написал"]):
+        logger.info("[synthesis] перехвачен мета-вопрос о диалоге")
+        history_text = format_history(history or [])
+        prompt = f"""=== ПОСЛЕДНИЕ СООБЩЕНИЯ ===
+{history_text}
+
+=== ТЕКУЩИЙ ВОПРОС ===
+{query}
+
+Ответь на вопрос пользователя, опираясь ТОЛЬКО на историю сообщений выше. 
+Если в истории есть номер заказа, назови его.
+Не используй ссылки на документы.
+Не пиши слово "Ответ:", просто дай текст.
+
+Ответ:"""
+        answer = await vllm_client.generate_text(
+            prompt=prompt, 
+            system="Ты — внимательный ассистент.", 
+            max_tokens=300
+        )
+        return answer.strip(), [], []
+
+    # === 2. Социальные запросы (имя) ===
+    is_social = any(kw in q_lower for kw in ["меня зовут", "как меня зовут", "моё имя", "мое имя"])
+    
+    if is_social and not tool_results:
+        logger.info("[synthesis] обнаружен социальный запрос, пропускаем RAG-контекст")
+        history_text = format_history(history or [])
+        summary_text = format_summary(summary)
+        memory_block = ""
+        if summary_text:
+            memory_block += f"=== КРАТКОЕ СОДЕРЖАНИЕ ПРЕДЫДУЩЕГО ДИАЛОГА ===\n{summary_text}\n\n"
+        if history_text:
+            memory_block += f"=== ПОСЛЕДНИЕ СООБЩЕНИЯ ===\n{history_text}\n\n"
+
+        prompt = f"""{memory_block}=== ТЕКУЩИЙ ВОПРОС ===
+{query}
+
+Ответь вежливо, используя историю диалога.
+Если пользователь сообщает имя — запомни его и поприветствуй.
+Если спрашивает имя, а его нет в истории — скажи, что не знаешь.
+НЕ ссылайся на документы. Это просто светская беседа.
+
+Ответ:"""
+
+        answer = await vllm_client.generate_text(
+            prompt=prompt,
+            system="Ты — вежливый ИИ-ассистент.",
+            max_tokens=200,
+            temperature=0.1,
+        )
+        return answer.strip(), [], []
 
     if not rag_chunks and not tool_results and not extra_text:
-        return (
-            "К сожалению, у меня нет информации по этому вопросу.",
-            [],
-            [],
-        )
+        return ("К сожалению, у меня нет информации по этому вопросу.", [], [])
 
-    # === Собираем контекст ===
+    # === 3. Собираем контекст ===
     context_parts: list[str] = []
     sources: list[Source] = []
     tools_used: list[str] = []
 
-    # 1. RAG-фрагменты
+    # 3.1 RAG
     if rag_chunks:
         context_parts.append("=== ФРАГМЕНТЫ ИЗ ДОКУМЕНТОВ ===\n")
         for i, ch in enumerate(rag_chunks, 1):
@@ -175,7 +217,7 @@ async def synthesize(
                 grade_score=ch.get("score"),
             ))
 
-    # 2. Tool-результаты
+    # 3.2 Tool
     if tool_results:
         context_parts.append("\n=== ДАННЫЕ ИЗ API ===\n")
         for tr in tool_results:
@@ -183,26 +225,31 @@ async def synthesize(
             tools_used.append(tool_name)
             text = tr.get("text", "")
             data = tr.get("data")
-            context_parts.append(f"Tool: {tool_name}")
+            
+            if tool_name == "get_order_items" and data:
+                items_count = len(data.get("data", []))
+                context_parts.append(f"Tool: {tool_name} (найдено {items_count} товаров)")
+            else:
+                context_parts.append(f"Tool: {tool_name}")
+                
             if text:
                 context_parts.append(text)
             if data:
                 context_parts.append(json.dumps(data, ensure_ascii=False)[:2000])
             context_parts.append("")
 
-    # 3. Extra text
     if extra_text:
         context_parts.append("\n=== ДОПОЛНИТЕЛЬНО ===\n")
         context_parts.append(extra_text)
 
     context = "\n".join(context_parts)
 
-    # === Определяем инструкцию ===
+    # === 4. Инструкция ===
     has_rag = bool(rag_chunks)
     has_tool = bool(tool_results)
     has_display = any(tr.get("data") for tr in tool_results)
 
-    is_technical = any(kw in query.lower() for kw in [
+    is_technical = any(kw in q_lower for kw in [
         "технически", "метод", "api", "апи", "запрос", "endpoint",
         "url", "json", "параметр",
     ])
@@ -216,9 +263,7 @@ async def synthesize(
     elif has_rag and is_technical:
         instruction = (
             "⚠️ ЗАПРОС ТЕХНИЧЕСКИЙ! Пользователь спрашивает про метод/API/технику. "
-            "В контексте есть техническая документация (API_инструкция). "
-            "ОБЯЗАТЕЛЬНО назови КОНКРЕТНЫЙ метод API (например, "
-            "SupplierPortal.ConfirmOrderBuyGroup), URL и параметры запроса. "
+            "ОБЯЗАТЕЛЬНО назови КОНКРЕТНЫЙ метод API, URL и параметры запроса. "
             "Ссылки в формате [doc_id:pN]."
         )
     elif has_rag:
@@ -230,14 +275,12 @@ async def synthesize(
         instruction = (
             "⚠️ ВАЖНО: данные о заказах УЖЕ ПОКАЗАНЫ пользователю "
             "в структурированном виде (карточка или таблица) на фронте. "
-            "Твоя задача — **ОТВЕТИТЬ НА ВОПРОС ПОЛЬЗОВАТЕЛЯ** "
-            "кратко и по делу, используя эти данные.\n\n"
+            "Твоя задача — ОТВЕТИТЬ НА ВОПРОС ПОЛЬЗОВАТЕЛЯ кратко и по делу.\n\n"
             "ПРАВИЛА:\n"
             "• Если вопрос про конкретное поле (статус, сумма, дата, склад, "
             "бренд, контрагент, адрес) — ответь ТОЛЬКО на этот вопрос одной фразой.\n"
-            "  Пример: «Какой статус?» → «Статус заказа №XXX — Подтверждён (код 50).»\n"
-            "  Пример: «Какая сумма?» → «Сумма заказа №XXX — 55.80 руб.»\n"
-            "  Пример: «Куда поставить?» → «Адрес доставки — МИНСКАЯ ОБЛ., ...»\n"
+            "• Если вопрос про возможность («могу ли», «можно ли») — "
+            "ответь «Да, можете» или «Нет, нельзя» на основе статуса.\n"
             "• Если вопрос общий («расскажи», «покажи») — дай КРАТКУЮ сводку "
             "(1-2 предложения).\n"
             "• НЕ пересказывай ВСЕ поля карточки — только релевантные вопросу.\n"
@@ -245,7 +288,7 @@ async def synthesize(
         )
     elif has_tool and not has_display:
         instruction = (
-            "В контексте есть данные из API, но без структурированного display. "
+            "В контексте есть данные из API. "
             "Опиши кратко, что найдено. Без ссылок на документы."
         )
     else:
@@ -254,14 +297,30 @@ async def synthesize(
             "Ответь на их основе, без ссылок на документы."
         )
 
-    # === Промпт ===
-    prompt = f"""ВОПРОС: {query}
+    # === 5. Память ===
+    history_text = format_history(history or [])
+    summary_text = format_summary(summary)
+
+    memory_block = ""
+    if summary_text:
+        memory_block += (
+            "=== КРАТКОЕ СОДЕРЖАНИЕ ПРЕДЫДУЩЕГО ДИАЛОГА ===\n"
+            f"{summary_text}\n\n"
+        )
+    if history_text:
+        memory_block += (
+            "=== ПОСЛЕДНИЕ СООБЩЕНИЯ ===\n"
+            f"{history_text}\n\n"
+        )
+
+    # === 6. Промпт ===
+    prompt = f"""{memory_block}
+=== ТЕКУЩИЙ ВОПРОС ПОЛЬЗОВАТЕЛЯ ===
+{query}
 
 {instruction}
 
 ВАЖНО: ссылки на документы только в формате [doc_id:pN].
-Например: [trebovaniya_10fc:p1]
-
 Если в контексте есть технические детали (методы API, URL, JSON-поля) —
 приводи их ДОСЛОВНО, не заменяй общими словами.
 
@@ -270,7 +329,7 @@ async def synthesize(
 
 Ответ:"""
 
-    # === max_tokens для tool+display ===
+    # === 7. max_tokens ===
     actual_max_tokens = max_tokens
     if has_tool and not has_rag and has_display:
         actual_max_tokens = 1000
@@ -278,6 +337,8 @@ async def synthesize(
     logger.info(
         f"[synthesis] Qwen3-8B: {len(rag_chunks)} rag, "
         f"{len(tool_results)} tool, {len(context)} симв., "
+        f"memory={len(history or [])} msgs + "
+        f"{'summary' if summary else 'no-summary'}, "
         f"technical={is_technical}, has_display={has_display}, "
         f"max_tokens={actual_max_tokens}"
     )
@@ -289,7 +350,7 @@ async def synthesize(
         temperature=0.1,
     )
 
-    # === Постпроцессинг ===
+    # === 8. Постпроцессинг ===
     answer = normalize_citations(answer)
 
     logger.info(f"[synthesis] ответ: {len(answer)} симв.")

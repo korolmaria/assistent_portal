@@ -101,6 +101,16 @@ class DisplayBlock(BaseModel):
 
 
 # ==========================================================================
+# Память диалога (stateless: фронт присылает, бэк не хранит)
+# ==========================================================================
+class ChatHistoryItem(BaseModel):
+    """Одно сообщение истории диалога (приходит с фронта)."""
+    role: Literal["user", "assistant"]
+    content: str = Field(..., max_length=8000)
+    id: str | None = None
+
+
+# ==========================================================================
 # Метаданные ответа
 # ==========================================================================
 class MessageMetadata(BaseModel):
@@ -114,6 +124,9 @@ class MessageMetadata(BaseModel):
     route_reason: str | None = None
     tools_used: list[str] = Field(default_factory=list)
     display: DisplayBlock | None = None
+    # --- память диалога ---
+    summary: str | None = None
+    summarized_up_to_id: str | None = None
 
 
 # ==========================================================================
@@ -123,6 +136,10 @@ class ChatRequest(BaseModel):
     """Тело POST /api/v1/ask и /api/v1/ask/stream."""
     message: str = Field(..., min_length=1, max_length=4000)
     route: Literal["auto", "rag", "tool"] = "auto"
+    # --- память диалога (stateless: фронт присылает, бэк не хранит) ---
+    history: list[ChatHistoryItem] = Field(default_factory=list)
+    summary: str | None = None
+    summarized_up_to_id: str | None = None
 
 
 # ==========================================================================
@@ -159,6 +176,9 @@ class SSEMetadata(BaseModel):
     route_reason: str | None = None
     tools_used: list[str] = Field(default_factory=list)
     display: DisplayBlock | None = None
+    # --- память диалога ---
+    summary: str | None = None
+    summarized_up_to_id: str | None = None
 
 
 class SSEError(BaseModel):

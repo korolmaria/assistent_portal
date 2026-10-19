@@ -5,6 +5,9 @@ FastAPI-приложение: SSE-стриминг ответов Supervisor д�
 - POST /api/v1/ask/stream — SSE-стриминг
 - POST /api/v1/ask — обычный JSON
 - GET /api/v1/health — health check
+
+Память диалога: stateless. Фронт присылает history/summary в каждом запросе,
+бэк возвращает обновлённое summary в metadata (фронт хранит в sessionStorage).
 """
 import json
 import time
@@ -79,12 +82,15 @@ async def ask_stream(
     События:
       data: {"type": "route", "route": "rag", "reason": "..."}
       data: {"type": "step", "message": "..."}
-      data: {"type": "metadata", "answer": "...", "sources": [...], ...}
+      data: {"type": "metadata", "answer": "...", "sources": [...],
+             "summary": "...", "summarized_up_to_id": "...", ...}
       data: [DONE]
     """
     jwt = _extract_jwt(authorization)
     logger.info(
         f"[/ask/stream] route={request.route}, "
+        f"memory={len(request.history)} msgs + "
+        f"{'summary' if request.summary else 'no-summary'}, "
         f"message={request.message[:80]!r}"
     )
 
@@ -95,6 +101,9 @@ async def ask_stream(
                 query=request.message,
                 route=request.route,
                 jwt=jwt,
+                history=request.history,
+                summary=request.summary,
+                summarized_up_to_id=request.summarized_up_to_id,
             ):
                 # Добавляем processingTime в финальные метаданные
                 if event.get("type") == "metadata":
@@ -138,12 +147,17 @@ async def ask(
     route = request.route
     route_reason = ""
     tools_used = []
+    new_summary: str | None = None
+    new_summarized_up_to_id: str | None = None
 
     try:
         async for event in run_supervisor(
             query=request.message,
             route=request.route,
             jwt=jwt,
+            history=request.history,
+            summary=request.summary,
+            summarized_up_to_id=request.summarized_up_to_id,
         ):
             etype = event.get("type")
             if etype == "route":
@@ -154,6 +168,8 @@ async def ask(
                 sources = event.get("sources", [])
                 display = event.get("display")
                 tools_used = event.get("tools_used", [])
+                new_summary = event.get("summary")
+                new_summarized_up_to_id = event.get("summarized_up_to_id")
             elif etype == "error":
                 return {
                     "success": False,
@@ -169,6 +185,8 @@ async def ask(
             "tools_used": tools_used,
             "display": display,
             "processingTime": round(time.time() - start_time, 2),
+            "summary": new_summary,
+            "summarized_up_to_id": new_summarized_up_to_id,
         }
 
     except Exception as e:
