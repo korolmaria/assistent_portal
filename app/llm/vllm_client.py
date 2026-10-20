@@ -48,6 +48,7 @@ class VLLMClient:
         max_tokens: int = 1024,
         temperature: float = 0.3,
         top_p: float = 0.95,
+        response_format: dict | None = None,  # <--- ДОБАВЛЕНО ДЛЯ GUIDED JSON
     ) -> str:
         """Простая текстовая генерация через Qwen3-8B."""
         messages: list[dict[str, str]] = []
@@ -55,12 +56,17 @@ class VLLMClient:
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
 
+        kwargs = {}
+        if response_format:
+            kwargs["response_format"] = response_format
+
         response = await self.text_client.chat.completions.create(
             model=settings.text_model_name,
             messages=messages,
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
+            **kwargs,
         )
         content = response.choices[0].message.content or ""
         logger.debug(

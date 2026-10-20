@@ -9,6 +9,12 @@ BRAND_IDS: dict[str, int] = {
     "евроопт": 6,
 }
 
+CLAIM_STATUS_LABELS = {
+    "40": ("Ожидает ответа", "warning"),
+    "50": ("Подтверждена", "success"),
+    "51": ("Отклонена", "error"),
+}
+
 ORDER_STATUS_IDS: dict[str, int] = {
     "на сайте": 10,
     "автоподтверждён": 48,
