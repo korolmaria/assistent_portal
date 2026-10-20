@@ -1,5 +1,6 @@
 """
 Tool-агент — вызывает инструменты SupplierPortal через LLM function calling.
+Поддерживает цепочки вызовов (Multi-Tool).
 """
 import json
 import re
@@ -23,6 +24,17 @@ class ToolAgentError(Exception):
     pass
 
 
+# Статусы претензий для отображения на фронте
+CLAIM_STATUS_MAP = {
+    10: ("Ожидает ответа", "warning"),
+    20: ("Подтверждена", "success"),
+    30: ("Отклонена", "error"),
+    40: ("Ожидает ответа", "warning"),
+    50: ("Подтверждена", "success"),
+    51: ("Отклонена", "error"),
+}
+
+
 def _safe_float(val) -> float | None:
     if val is None or val == "":
         return None
@@ -39,104 +51,9 @@ def _fmt_qty(val) -> str:
     return f"{num:g}"
 
 
-async def extract_params(query: str) -> tuple[str, dict[str, Any]]:
-    """
-    LLM извлекает имя инструмента и параметры из естественного запроса.
-    """
-    system_prompt = (
-        "Ты — строгий парсер параметров для API. Твоя задача — извлечь из запроса "
-        "ТОЛЬКО те фильтры, которые пользователь назвал ЯВНО. Не добавляй ничего от себя.\n"
-        "\n"
-        "ПРАВИЛА ИЗВЛЕЧЕНИЯ ПАРАМЕТРОВ:\n"
-        "1. Номера заказов («заказ 56», «заказы 1 и 2») → order_ids: [56] / [1, 2]\n"
-        "2. Бренды: Хит → 2, Грошык → 3, Евроопт → 6 → brand_ids\n"
-        "3. Статусы: на сайте → 10, автоподтверждён → 48, "
-        "подтверждён → 50, выполнен → 90 → checkx\n"
-        "4. Обработка (IsProcessed): ставь ТОЛЬКО если явно сказано «необработанные» (0) или «обработанные» (1).\n"
-        "   ⚠️ Слова «неподтвержденные», «подтвержденные», «на сайте», «автоподтверждённые» — это СТАТУС (Checkx), а НЕ обработка (IsProcessed)!\n"
-        "5. Области: Брест → 71, Витебск → 73, Гомель → 75, "
-        "Гродно → 77, Минск → 78, Могилёв → 81 → region_ids\n"
-        "6. ПЕРИОДЫ (ВАЖНО!):\n"
-        "   - «за октябрь» / «в октябре» → date_begin: 2026-10-01, date_end: 2026-10-31\n"
-        "   - «за сентябрь» → date_begin: 2026-09-01, date_end: 2026-09-30\n"
-        "   - Всегда ставь ОБА параметра.\n"
-        "7. ЧИСЛОВЫЕ артикулы («артикул 615300») → goods_ids: [615300]\n"
-        "8. Названия товаров («молоко», «крем») → goods_name: \"молоко\"\n"
-        "\n"
-        "🔴 ГЛАВНОЕ ПРАВИЛО (ИЗВЛЕКАЙ ТОЛЬКО ЯВНО УКАЗАННОЕ):\n"
-        "Если пользователь НЕ назвал фильтр в тексте — НЕ ЗАПОЛНЯЙ его.\n"
-        " - Нет слова «молоко» → не ставь goods_name.\n"
-        " - Нет слова «подтверждён» / «на сайте» → не ставь checkx.\n"
-        " - Нет слова «обработан» / «не обработан» → не ставь is_processed.\n"
-        " - Нет месяца → не ставь date_begin.\n"
-        " - Нет бренда → не ставь brand_ids.\n"
-        "\n"
-        "🔴 АБСОЛЮТНОЕ ПРАВИЛО ДЛЯ НОМЕРА ЗАКАЗА:\n"
-        "Если в запросе ЕСТЬ номер заказа (например, «заказ 98010227»), "
-        "то ставь ТОЛЬКО order_ids: [98010227]. И БОЛЬШЕ НИЧЕГО.\n"
-        "НЕ ДОБАВЛЯЙ checkx, date_begin, brand_ids, даже если в тексте есть слова "
-        "«подтверждён», «за октябрь» или «Хит». Номер заказа уже уникален.\n"
-        "\n"
-        "⚠️ НО ЕСЛИ НОМЕРА ЗАКАЗА НЕТ (например, «покажи неподтверждённые заказы за октябрь»):\n"
-        "Тогда извлекай ВСЕ фильтры, которые есть в тексте:\n"
-        "  - «неподтверждённые» → checkx: [10]\n"
-        "  - «за октябрь» → date_begin: 2026-10-01, date_end: 2026-10-31\n"
-        "  - «Хит» → brand_ids: [2]\n"
-        "\n"
-        "ВАЖНО:\n"
-        "- Выбор tool делай ТОЛЬКО по description в списке tools.\n"
-        "- Не выдумывай параметры, которых нет в схеме tool.\n"
-    )
-
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": query},
-    ]
-
-    message = await vllm_client.chat_with_tools(
-        messages=messages,
-        tools=get_all_specs(),
-        tool_choice="auto",
-        temperature=0.1,
-    )
-
-    if not message.tool_calls:
-        logger.warning(f"[tool_agent] LLM не выбрал инструмент для: {query}")
-        raise ToolAgentError(
-            "Не удалось определить, какой инструмент нужен для этого запроса."
-        )
-
-    tool_call = message.tool_calls[0]
-    tool_name = tool_call.function.name
-
-    try:
-        params = json.loads(tool_call.function.arguments or "{}")
-    except json.JSONDecodeError as e:
-        logger.error(f"[tool_agent] плохой JSON от LLM: {tool_call.function.arguments}")
-        raise ToolAgentError(f"Ошибка парсинга параметров: {e}") from e
-
-    # === ПРЕДОХРАНИТЕЛЬ 1: чистим лишние фильтры, если есть номер заказа ===
-    has_order_id = "order_ids" in params and params["order_ids"]
-    if has_order_id:
-        forbidden = ["checkx", "date_begin", "date_end", "brand_ids", "is_processed", "goods_ids", "goods_name"]
-        for f in forbidden:
-            if f in params:
-                logger.warning(f"[tool_agent] удаляю лишний фильтр '{f}' из запроса (есть order_ids)")
-                del params[f]
-
-    # === ПРЕДОХРАНИТЕЛЬ 2: is_processed только если явно сказано "обработан"/"необработан" ===
-    query_lower = query.lower()
-    if "is_processed" in params:
-        has_explicit_processed = any(w in query_lower for w in ["обработан", "необработан", "не обработан"])
-        if not has_explicit_processed:
-            logger.warning("[tool_agent] удаляю is_processed (не было явного упоминания обработки)")
-            del params["is_processed"]
-    # =====================================================================
-
-    logger.info(f"[tool_agent] LLM выбрал: {tool_name}({params})")
-    return tool_name, params
-
-
+# ==========================================================================
+# Билдеры для заказов
+# ==========================================================================
 def build_display_block(orders: list[dict[str, Any]]) -> dict[str, Any] | None:
     if not orders:
         return None
@@ -146,6 +63,23 @@ def build_display_block(orders: list[dict[str, Any]]) -> dict[str, Any] | None:
     return {"type": "table", "data": orders, "extra": {"count": len(orders), "total_sum": total_sum}}
 
 
+def build_human_summary(orders: list[dict[str, Any]]) -> str:
+    if not orders:
+        return "По вашему запросу заказы не найдены."
+    count = len(orders)
+    total = sum(float(o.get("sum") or 0) for o in orders if o.get("sum") is not None)
+    if count == 1:
+        o = orders[0]
+        order_id = o.get("order_id")
+        status = o.get("status", "—")
+        contractor = o.get("contractor") or "поставщик"
+        return f"Найден 1 заказ №{order_id} от {contractor} на сумму {total:,.2f} руб. Статус: {status}."
+    return f"Найдено {count} заказов на общую сумму {total:,.2f} руб. Подробности в таблице ниже."
+
+
+# ==========================================================================
+# Билдеры для товаров в заказе
+# ==========================================================================
 def build_items_display_block(
     items: list[dict[str, Any]], amount: int, page_qty: int, page_number: int = 1, limit: int = 30
 ) -> dict[str, Any] | None:
@@ -165,20 +99,6 @@ def build_items_display_block(
             "has_more": page_number < page_qty,
         },
     }
-
-
-def build_human_summary(orders: list[dict[str, Any]]) -> str:
-    if not orders:
-        return "По вашему запросу заказы не найдены."
-    count = len(orders)
-    total = sum(float(o.get("sum") or 0) for o in orders if o.get("sum") is not None)
-    if count == 1:
-        o = orders[0]
-        order_id = o.get("order_id")
-        status = o.get("status", "—")
-        contractor = o.get("contractor") or "поставщик"
-        return f"Найден 1 заказ №{order_id} от {contractor} на сумму {total:,.2f} руб. Статус: {status}."
-    return f"Найдено {count} заказов на общую сумму {total:,.2f} руб. Подробности в таблице ниже."
 
 
 def build_items_human_summary(items: list[dict[str, Any]], amount: int, page_qty: int) -> str:
@@ -204,6 +124,131 @@ def build_items_human_summary(items: list[dict[str, Any]], amount: int, page_qty
     return f"Найдено {amount} позиций {orders_part}. Показаны первые {count} на сумму {total:,.2f} руб. (стр. 1 из {page_qty})."
 
 
+# ==========================================================================
+# Билдеры для претензий
+# ==========================================================================
+def build_claims_summary(claims: list[dict[str, Any]]) -> str:
+    """Короткий текстовый ответ по списку претензий."""
+    if not claims:
+        return "По вашему запросу претензии не найдены."
+
+    count = len(claims)
+    if count == 1:
+        c = claims[0]
+        return f"Найдена 1 претензия №{c.get('claim_id')} по заказу №{c.get('order_id')}."
+    
+    return f"Найдено {count} претензий. Подробности в таблице ниже."
+
+
+def build_claims_display(claims: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """DisplayBlock для претензий: обогащает статусы и отдает таблицу или карточку."""
+    if not claims:
+        return None
+
+    enriched_claims = []
+    for c in claims:
+        status_code = c.get("status")
+        
+        # Переводим код в текст и цвет
+        if isinstance(status_code, (int, str)) and str(status_code).isdigit():
+            status_text, status_type = CLAIM_STATUS_MAP.get(
+                int(status_code), (f"Код {status_code}", "default")
+            )
+        else:
+            status_text, status_type = str(status_code or "—"), "default"
+
+        enriched_claims.append({
+            "claim_id": c.get("claim_id"),
+            "created_at": str(c.get("created_at", "")).split(" ")[0],
+            "status": status_text,
+            "status_type": status_type,
+            "order_id": c.get("order_id"),
+            "warehouse": c.get("warehouse"),
+            "shipment_date": c.get("shipment_date"),
+        })
+
+    if len(enriched_claims) == 1:
+        return {"type": "claims_card", "data": enriched_claims[0], "extra": {}}
+
+    return {
+        "type": "claims_table",
+        "data": enriched_claims,
+        "extra": {"count": len(enriched_claims)},
+    }
+
+
+# ==========================================================================
+# Билдеры для детализации претензий
+# ==========================================================================
+def build_claim_details_summary(items: list[dict[str, Any]]) -> str:
+    if not items:
+        return "По указанным претензиям детали не найдены."
+    
+    claim_ids = sorted({i.get("claim_id") for i in items if i.get("claim_id")})
+    claims_str = ", ".join(str(c) for c in claim_ids)
+    
+    total_penalty = sum(float(i.get("total_penalty") or 0) for i in items if i.get("total_penalty") is not None)
+    
+    return (
+        f"Найдено {len(items)} позиций в претензии №{claims_str}. "
+        f"Общая сумма штрафа: {total_penalty:,.2f} руб."
+    )
+
+
+def build_claim_details_display(items: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if not items:
+        return None
+    
+    total_penalty = sum(float(i.get("total_penalty") or 0) for i in items if i.get("total_penalty") is not None)
+    
+    return {
+        "type": "claim_details_table",
+        "data": items,
+        "extra": {
+            "count": len(items),
+            "total_penalty": total_penalty
+        },
+    }
+
+
+# ==========================================================================
+# Форматирование результата для одного инструмента
+# ==========================================================================
+def _format_tool_result(tool_name: str, parsed: Any, api_data: dict) -> tuple[str, dict | None]:
+    if tool_name == "get_order_items":
+        items = parsed["items"]
+        amount = parsed["amount"]
+        page_qty = parsed["page_qty"]
+        text = build_items_human_summary(items, amount, page_qty)
+        display = build_items_display_block(
+            items, amount, page_qty,
+            page_number=api_data.get("PageNumber", 1),
+            limit=api_data.get("Limit", 30),
+        )
+        return text, display
+
+    elif tool_name == "get_supplier_claims":
+        claims = parsed
+        text = build_claims_summary(claims)
+        display = build_claims_display(claims)
+        return text, display
+
+    elif tool_name == "get_claim_details":
+        items = parsed
+        text = build_claim_details_summary(items)
+        display = build_claim_details_display(items)
+        return text, display
+
+    else:
+        orders = parsed
+        text = build_human_summary(orders)
+        display = build_display_block(orders)
+        return text, display
+
+
+# ==========================================================================
+# Главный запуск
+# ==========================================================================
 async def run_tool_agent(
     query: str,
     jwt: str,
@@ -227,47 +272,118 @@ async def run_tool_agent(
                         logger.info(f"[tool_agent] подставили заказ {order_id} из истории")
                     break
 
+    # Если инструмент задан принудительно — вызываем только его
     if forced_tool:
         tool_name = forced_tool
-        params: dict[str, Any] = {}
-    else:
-        tool_name, params = await extract_params(search_query)
-
-    tool = get_tool(tool_name)
-    if not tool:
-        raise ToolAgentError(f"Инструмент '{tool_name}' не зарегистрирован.")
-
-    metadata["tools_used"].append(tool_name)
-    api_data = params_to_api(params, tool_name)
-    logger.info(f"[tool_agent] вызов {tool['api_method']} с {api_data}")
-
-    try:
+        tool = get_tool(tool_name)
+        if not tool:
+            raise ToolAgentError(f"Инструмент '{tool_name}' не зарегистрирован.")
+        
+        metadata["tools_used"].append(tool_name)
+        api_data = params_to_api({}, tool_name)
+        logger.info(f"[tool_agent] вызов {tool['api_method']} с {api_data}")
+        
         raw = await supplier_portal.call(method=tool["api_method"], data=api_data, jwt=jwt)
-    except SupplierPortalError as e:
-        logger.error(f"[tool_agent] SupplierPortal error: {e}")
-        raise ToolAgentError(f"Ошибка API портала: {e.description}") from e
-    except Exception as e:
-        logger.exception("[tool_agent] ошибка вызова SupplierPortal")
-        raise ToolAgentError(f"Не удалось получить данные: {e}") from e
+        parsed = tool["parser"](raw)
+        text, display = _format_tool_result(tool_name, parsed, api_data)
+        return text, display, metadata
 
-    parser = tool["parser"]
-    parsed = parser(raw)
+    # === ЦИКЛ ВЫЗОВА ИНСТРУМЕНТОВ (Multi-Tool) ===
+    system_prompt = (
+        "Ты — ассистент, который вызывает инструменты API для получения данных.\n"
+        "Если для ответа нужно несколько действий (например, сначала найти ID претензии, "
+        "а потом посмотреть её детали), вызывай инструменты последовательно.\n"
+        "Не выдумывай параметры. Если не хватает данных, вызывай следующий инструмент.\n"
+    )
 
-    if tool_name == "get_order_items":
-        items = parsed["items"]
-        amount = parsed["amount"]
-        page_qty = parsed["page_qty"]
-        logger.info(f"[tool_agent] получено {len(items)} позиций, amount={amount}, page_qty={page_qty}")
-        text = build_items_human_summary(items, amount, page_qty)
-        display = build_items_display_block(
-            items, amount, page_qty,
-            page_number=api_data.get("PageNumber", 1),
-            limit=api_data.get("Limit", 30),
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": search_query},
+    ]
+
+    last_text = "Не удалось получить данные."
+    last_display = None
+
+    # Максимум 3 шага, чтобы избежать бесконечных циклов
+    for step in range(3):
+        message = await vllm_client.chat_with_tools(
+            messages=messages,
+            tools=get_all_specs(),
+            tool_choice="auto",
+            temperature=0.1,
         )
-    else:
-        orders = parsed
-        logger.info(f"[tool_agent] получено {len(orders)} заказов")
-        text = build_human_summary(orders)
-        display = build_display_block(orders)
 
-    return text, display, metadata
+        if not message.tool_calls:
+            break  # Инструменты больше не нужны, выходим из цикла
+
+        # Добавляем сообщение от ассистента с tool_calls в историю
+        messages.append({
+            "role": "assistant",
+            "content": message.content or "",
+            "tool_calls": [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {"name": tc.function.name, "arguments": tc.function.arguments}
+                } for tc in message.tool_calls
+            ]
+        })
+
+        # Выполняем ВСЕ инструменты, которые запросила модель на этом шаге
+        for tool_call in message.tool_calls:
+            tool_name = tool_call.function.name
+            try:
+                params = json.loads(tool_call.function.arguments or "{}")
+            except json.JSONDecodeError:
+                params = {}
+
+            # Применяем предохранители (защита от лишних фильтров)
+            has_order_id = "order_ids" in params and params["order_ids"]
+            if has_order_id and tool_name not in ("get_supplier_claims", "get_claim_details"):
+                forbidden = ["checkx", "date_begin", "date_end", "brand_ids", "is_processed", "goods_ids", "goods_name"]
+                for f in forbidden:
+                    if f in params:
+                        del params[f]
+            
+            query_lower = query.lower()
+            if "is_processed" in params:
+                if not any(w in query_lower for w in ["обработан", "необработан", "не обработан"]):
+                    del params["is_processed"]
+
+            tool = get_tool(tool_name)
+            if not tool:
+                logger.warning(f"[tool_agent] LLM вызвала неизвестный инструмент: {tool_name}")
+                continue
+
+            logger.info(f"[tool_agent] Шаг {step+1}. LLM выбрал: {tool_name}({params})")
+            metadata["tools_used"].append(tool_name)
+
+            api_data = params_to_api(params, tool_name)
+            logger.info(f"[tool_agent] вызов {tool['api_method']} с {api_data}")
+
+            try:
+                raw = await supplier_portal.call(method=tool["api_method"], data=api_data, jwt=jwt)
+                parsed = tool["parser"](raw)
+                text, display = _format_tool_result(tool_name, parsed, api_data)
+                
+                # Сохраняем последний результат
+                last_text = text
+                if display:
+                    last_display = display
+
+                # Отправляем результат обратно в LLM, чтобы она могла решить, что делать дальше
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": f"{text}\nДанные: {json.dumps(display, ensure_ascii=False)[:2000]}" if display else text
+                })
+
+            except Exception as e:
+                logger.error(f"[tool_agent] Ошибка вызова {tool_name}: {e}")
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": f"Ошибка API: {e}"
+                })
+
+    return last_text, last_display, metadata

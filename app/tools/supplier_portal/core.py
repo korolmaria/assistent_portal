@@ -1,8 +1,5 @@
 """
-Низкоуровневый клиент к SupplierPortal (AlwaysOn).
-
-Формат: JSON-RPC через POST /Json
-Обёртка: {"CRC": "", "Packet": {"JWT": ..., "MethodName": ..., "ServiceNumber": ..., "Data": {...}}}
+Ядро клиента SupplierPortal — транспорт и проверка ошибок.
 """
 from typing import Any
 
@@ -23,7 +20,7 @@ class SupplierPortalError(Exception):
 
 
 class SupplierPortalClient:
-    """Универсальный клиент к AlwaysOn /Json."""
+    """Универсальный клиент к AlwaysOn /Json (только транспорт)."""
 
     def __init__(self) -> None:
         self.base_url = settings.supplier_portal_url.rstrip("/")
@@ -44,9 +41,6 @@ class SupplierPortalClient:
     ) -> dict[str, Any]:
         """
         Универсальный вызов любого метода SupplierPortal.
-        method: например, "SupplierPortal.GetOrderBuyGroup"
-        data: тело запроса (фильтры)
-        jwt: токен пользователя с фронта
         """
         payload = {
             "CRC": "",
@@ -83,34 +77,3 @@ class SupplierPortalClient:
 
         logger.debug(f"[SupplierPortal] {method} → OK")
         return result
-
-    # ------------------------------------------------------------------
-    # Конкретные методы (обёртки над call)
-    # ------------------------------------------------------------------
-    async def get_order_buy_group(
-        self,
-        filters: dict[str, Any],
-        jwt: str,
-    ) -> dict[str, Any]:
-        """Список заказов поставщика (статусы 10-90)."""
-        return await self.call(
-            method="SupplierPortal.GetOrderBuyGroup",
-            data=filters,
-            jwt=jwt,
-        )
-
-    async def get_order_buy(
-        self,
-        filters: dict[str, Any],
-        jwt: str,
-    ) -> dict[str, Any]:
-        """Содержимое заказов (позиции/строки)."""
-        return await self.call(
-            method="SupplierPortal.GetOrderBuy",
-            data=filters,
-            jwt=jwt,
-        )
-
-
-# Singleton
-supplier_portal = SupplierPortalClient()

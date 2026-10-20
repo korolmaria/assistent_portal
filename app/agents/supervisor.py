@@ -173,6 +173,11 @@ async def run_supervisor(
             except Exception as e:
                 logger.exception(f"[supervisor] Tool-ошибка: {e}")
                 yield {"type": "step", "message": f"   ⚠️ ошибка API: {e}"}
+                tool_results.append({
+                    "tool_name": "error",
+                    "text": f"Ошибка API: {e}",
+                    "data": None,
+                })
 
         # 3. Synthesis
         yield {"type": "step", "message": "✍️ Генерация ответа..."}
@@ -187,18 +192,20 @@ async def run_supervisor(
         has_rag = bool(rag_chunks)
 
         q_orig = original_query.lower()
-        is_specific_question = any(kw in q_orig for kw in [
-            "есть", "заказано", "какой", "какая", "какое", "сколько", 
-            "сумма", "статус", "подтвердить", "можно", "товары"
-        ])
+        
+        # Проверяем, просит ли пользователь просто "показать список" (без конкретики)
+        is_just_show = any(kw in q_orig for kw in ["покажи", "выведи", "список", "какие заказы", "какие претензии"]) and \
+                       not any(kw in q_orig for kw in ["какой", "какая", "когда", "сколько", "почему", "есть ли", "сумма", "статус", "самый", "дорогой"])
 
-        if has_display and not has_rag and tool_text and not is_specific_question:
-            logger.info(f"[supervisor] общий запрос: используем готовый text tool-агента")
+        if has_display and not has_rag and tool_text and is_just_show:
+            # Только для простого «покажи список» берем готовый текст
+            logger.info(f"[supervisor] запрос на список: используем готовый text tool-агента")
             answer = tool_text
             final_sources = []
             synth_tools = tools_used
         else:
-            logger.info(f"[supervisor] конкретный вопрос: отдаем в synthesize")
+            # ВО ВСЕХ ОСТАЛЬНЫХ СЛУЧАЯХ (вопросы, детали, претензии) — отдаем в synthesize
+            logger.info(f"[supervisor] вопрос по данным: отдаем в synthesize")
             answer, final_sources, synth_tools = await synthesize(
                 query=original_query,
                 rag_chunks=rag_chunks,
