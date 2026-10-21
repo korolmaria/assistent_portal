@@ -3,7 +3,7 @@ Synthesis-агент: собирает финальный ответ через 
 """
 import json
 import re
-from typing import Any
+from typing import Any, Literal
 
 from loguru import logger
 
@@ -81,6 +81,18 @@ SYSTEM_PROMPT = """Ты — ИИ-помощник для поставщиков 
     Пример: «Какой товар самый дорогой?» → «Самый дорогой товар — Хлеб "ФИТНЕС" (1.43 BYN).»
     Пример: «Сколько всего недопоставили?» → «Всего недопоставлено 7 единиц товара.»
 
+12. АНАЛИТИЧЕСКИЙ БЛОК:
+    Если в контексте есть блок «=== АНАЛИЗ ===», используй его как ОСНОВУ ответа.
+    Не пересказывай данные таблицы заново — опирайся на выводы аналитика.
+    Если аналитик указал числа/проценты — приведи их в ответе.
+
+13. ПРИОРИТЕТ АНАЛИЗА (КРИТИЧЕСКИ ВАЖНО):
+    Если в контексте присутствует блок «=== АНАЛИЗ ===», это означает, что другой агент
+    УЖЕ изучил данные и сделал выводы. Твоя задача — ПЕРЕСКАЗАТЬ ЭТИ ВЫВОДЫ пользователю.
+    Даже если в таблице данных нет прямого ответа, но в блоке «=== АНАЛИЗ ===» написано,
+    что данных недостаточно — ты ОБЯЗАН сообщить пользователю именно это («Аналитик сообщает, что...»).
+    НИКОГДА не пиши «В предоставленных данных нет ответа», если блок АНАЛИЗ не пуст.
+
 СТИЛЬ:
 - Профессиональный, деловой.
 - Конкретика: числа, названия, статусы, методы, URL.
@@ -89,36 +101,12 @@ SYSTEM_PROMPT = """Ты — ИИ-помощник для поставщиков 
 
 
 def normalize_citations(text: str) -> str:
-    text = re.sub(
-        r"\[doc_id:([a-zA-Z0-9_\-]+)\s*[|:]\s*стр\.\s*(\d+)\]",
-        r"[\1:p\2]",
-        text,
-    )
-    text = re.sub(
-        r"\[([a-zA-Z0-9_\-]+):стр\.\s*(\d+)\]",
-        r"[\1:p\2]",
-        text,
-    )
-    text = re.sub(
-        r"\[([a-zA-Z0-9_\-]+)\s*\|\s*стр\.\s*(\d+)\]",
-        r"[\1:p\2]",
-        text,
-    )
-    text = re.sub(
-        r"\[doc_id:([a-zA-Z0-9_\-]+):p(\d+)\]",
-        r"[\1:p\2]",
-        text,
-    )
-    text = re.sub(
-        r"\[doc_id:([a-zA-Z0-9_\-]+)\]",
-        r"[\1]",
-        text,
-    )
-    text = re.sub(
-        r"\[([a-zA-Z0-9_\-]+):\s*стр\.\s*(\d+)\]",
-        r"[\1:p\2]",
-        text,
-    )
+    text = re.sub(r"\[doc_id:([a-zA-Z0-9_\-]+)\s*[|:]\s*стр\.\s*(\d+)\]", r"[\1:p\2]", text)
+    text = re.sub(r"\[([a-zA-Z0-9_\-]+):стр\.\s*(\d+)\]", r"[\1:p\2]", text)
+    text = re.sub(r"\[([a-zA-Z0-9_\-]+)\s*\|\s*стр\.\s*(\d+)\]", r"[\1:p\2]", text)
+    text = re.sub(r"\[doc_id:([a-zA-Z0-9_\-]+):p(\d+)\]", r"[\1:p\2]", text)
+    text = re.sub(r"\[doc_id:([a-zA-Z0-9_\-]+)\]", r"[\1]", text)
+    text = re.sub(r"\[([a-zA-Z0-9_\-]+):\s*стр\.\s*(\d+)\]", r"[\1:p\2]", text)
     return text
 
 
@@ -139,6 +127,8 @@ async def synthesize(
     max_tokens: int = 2500,
     history: list[ChatHistoryItem] | None = None,
     summary: str | None = None,
+    mode: Literal["verbatim", "explain", "analysis"] = "explain",
+    analysis: str | None = None,
 ) -> tuple[str, list[Source], list[str]]:
     rag_chunks = rag_chunks or []
     tool_results = tool_results or []
@@ -161,15 +151,12 @@ async def synthesize(
 
 Ответ:"""
         answer = await vllm_client.generate_text(
-            prompt=prompt, 
-            system="Ты — внимательный ассистент.", 
-            max_tokens=300
+            prompt=prompt, system="Ты — внимательный ассистент.", max_tokens=300,
         )
         return answer.strip(), [], []
 
     # === 2. Социальные запросы (имя) ===
     is_social = any(kw in q_lower for kw in ["меня зовут", "как меня зовут", "моё имя", "мое имя"])
-    
     if is_social and not tool_results:
         logger.info("[synthesis] обнаружен социальный запрос, пропускаем RAG-контекст")
         history_text = format_history(history or [])
@@ -189,24 +176,19 @@ async def synthesize(
 НЕ ссылайся на документы. Это просто светская беседа.
 
 Ответ:"""
-
         answer = await vllm_client.generate_text(
-            prompt=prompt,
-            system="Ты — вежливый ИИ-ассистент.",
-            max_tokens=200,
-            temperature=0.1,
+            prompt=prompt, system="Ты — вежливый ИИ-ассистент.", max_tokens=200, temperature=0.1,
         )
         return answer.strip(), [], []
 
     if not rag_chunks and not tool_results and not extra_text:
         return ("К сожалению, у меня нет информации по этому вопросу.", [], [])
 
-    # === 3. Собираем контекст ===
+    # === 3. Контекст ===
     context_parts: list[str] = []
     sources: list[Source] = []
     tools_used: list[str] = []
 
-    # 3.1 RAG
     if rag_chunks:
         context_parts.append("=== ФРАГМЕНТЫ ИЗ ДОКУМЕНТОВ ===\n")
         for i, ch in enumerate(rag_chunks, 1):
@@ -228,7 +210,6 @@ async def synthesize(
                 grade_score=ch.get("score"),
             ))
 
-    # 3.2 Tool
     if tool_results:
         context_parts.append("\n=== ДАННЫЕ ИЗ API ===\n")
         for tr in tool_results:
@@ -236,19 +217,22 @@ async def synthesize(
             tools_used.append(tool_name)
             text = tr.get("text", "")
             data = tr.get("data")
-            
             if tool_name == "get_order_items" and data:
                 items_count = len(data.get("data", []))
                 context_parts.append(f"Tool: {tool_name} (найдено {items_count} товаров)")
             else:
                 context_parts.append(f"Tool: {tool_name}")
-                
             if text:
                 context_parts.append(text)
             if data:
-                # Увеличили лимит до 8000, чтобы данные таблиц не обрезались
                 context_parts.append(json.dumps(data, ensure_ascii=False)[:8000])
             context_parts.append("")
+
+    # === НОВОЕ: блок анализа ===
+    if analysis:
+        context_parts.append("\n=== АНАЛИЗ ===\n")
+        context_parts.append(analysis)
+        context_parts.append("")
 
     if extra_text:
         context_parts.append("\n=== ДОПОЛНИТЕЛЬНО ===\n")
@@ -256,7 +240,7 @@ async def synthesize(
 
     context = "\n".join(context_parts)
 
-    # === 4. Инструкция ===
+    # === 4. Инструкция (учитывает mode) ===
     has_rag = bool(rag_chunks)
     has_tool = bool(tool_results)
     has_display = any(tr.get("data") for tr in tool_results)
@@ -266,7 +250,27 @@ async def synthesize(
         "url", "json", "параметр",
     ])
 
-    if has_rag and has_tool:
+    if mode == "analysis" and analysis:
+        instruction = (
+            "⚠️ КРИТИЧЕСКИ ВАЖНО: в контексте есть блок «=== АНАЛИЗ ===» — это уже готовый "
+            "аналитический вывод по данным, сделанный отдельным агентом.\n\n"
+            "ТВОЯ ЗАДАЧА: пересказать этот АНАЛИЗ в ответ пользователю. "
+            "Опирайся на него как на ГЛАВНЫЙ источник. Таблица данных — вспомогательная.\n\n"
+            "ПРАВИЛА:\n"
+            "• Если в АНАЛИЗЕ есть числа, проценты, сравнения — ОБЯЗАТЕЛЬНО приведи их.\n"
+            "• Если в АНАЛИЗЕ написано, что данных недостаточно (например, «за сентябрь данных нет») — "
+            "так и напиши пользователю: «Аналитик сообщает, что...».\n"
+            "• НИКОГДА не пиши «В предоставленных данных нет ответа», если в блоке АНАЛИЗ "
+            "есть хоть какой-то текст. Анализ — это и есть ответ.\n"
+            "• НЕ пересказывай таблицу заново — она уже показана пользователю на фронте.\n"
+            "• Ответ — 2-4 предложения."
+        )
+    elif mode == "verbatim" and has_display and not has_rag:
+        instruction = (
+            "Данные уже показаны пользователю в структурированном виде (карточка/таблица). "
+            "Дай КРАТКУЮ сводку (1-2 предложения) без пересказа всех полей."
+        )
+    elif has_rag and has_tool:
         instruction = (
             "В контексте есть И правила из документов, И данные из API. "
             "Сначала объясни правило со ссылкой [doc_id:pN], "
@@ -314,15 +318,9 @@ async def synthesize(
 
     memory_block = ""
     if summary_text:
-        memory_block += (
-            "=== КРАТКОЕ СОДЕРЖАНИЕ ПРЕДЫДУЩЕГО ДИАЛОГА ===\n"
-            f"{summary_text}\n\n"
-        )
+        memory_block += f"=== КРАТКОЕ СОДЕРЖАНИЕ ПРЕДЫДУЩЕГО ДИАЛОГА ===\n{summary_text}\n\n"
     if history_text:
-        memory_block += (
-            "=== ПОСЛЕДНИЕ СООБЩЕНИЯ ===\n"
-            f"{history_text}\n\n"
-        )
+        memory_block += f"=== ПОСЛЕДНИЕ СООБЩЕНИЯ ===\n{history_text}\n\n"
 
     # === 6. Промпт ===
     prompt = f"""{memory_block}
@@ -342,12 +340,15 @@ async def synthesize(
 
     # === 7. max_tokens ===
     actual_max_tokens = max_tokens
-    if has_tool and not has_rag and has_display:
+    if mode == "analysis":
+        actual_max_tokens = 1200
+    elif has_tool and not has_rag and has_display:
         actual_max_tokens = 1000
 
     logger.info(
-        f"[synthesis] Qwen3-8B: {len(rag_chunks)} rag, "
+        f"[synthesis] mode={mode}, {len(rag_chunks)} rag, "
         f"{len(tool_results)} tool, {len(context)} симв., "
+        f"analysis={'yes' if analysis else 'no'}, "
         f"memory={len(history or [])} msgs + "
         f"{'summary' if summary else 'no-summary'}, "
         f"technical={is_technical}, has_display={has_display}, "
@@ -361,8 +362,6 @@ async def synthesize(
         temperature=0.1,
     )
 
-    # === 8. Постпроцессинг ===
     answer = normalize_citations(answer)
-
     logger.info(f"[synthesis] ответ: {len(answer)} симв.")
     return answer.strip(), sources, tools_used

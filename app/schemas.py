@@ -90,14 +90,36 @@ class DisplayBlock(BaseModel):
     """
     Структурированный блок для рендера на фронте.
     Тип определяет, как интерпретировать data:
-      - card  → OrderCardData
-      - info  → InfoData
-      - table → list[OrderCardData]
-      - text  → None (только extra)
+      - card                 → OrderCardData
+      - info                 → InfoData
+      - table                → list[OrderCardData]
+      - text                 → None (только extra)
+      - order_items_table    → list[товары в заказе] (tool_agent.get_order_items)
+      - claims_card          → одна претензия (tool_agent.get_supplier_claims)
+      - claims_table         → list[претензии] (tool_agent.get_supplier_claims)
+      - claim_details_table  → list[детали претензии] (tool_agent.get_claim_details)
     """
-    type: Literal["card", "info", "table", "text", "order_items_table"]
+    type: Literal[
+        "card",
+        "info",
+        "table",
+        "text",
+        "order_items_table",
+        "claims_card",
+        "claims_table",
+        "claim_details_table",
+    ]
     data: Any = None
     extra: dict[str, Any] | None = None
+
+
+# ==========================================================================
+# План (возвращается Planner, пробрасывается в метаданные)
+# ==========================================================================
+class PlanStep(BaseModel):
+    """Один шаг плана: какой агент и зачем."""
+    agent: Literal["rag", "tool", "analyst"]
+    purpose: str = ""
 
 
 # ==========================================================================
@@ -120,8 +142,11 @@ class MessageMetadata(BaseModel):
     steps: list[str] = Field(default_factory=list)
     processingTime: float | None = None
     answer: str | None = None
-    route: Literal["auto", "rag", "tool"] | None = None
+    # route — строка, т.к. теперь бывает "rag", "tool", "rag+tool",
+    # "tool+analyst", "rag+tool+analyst" и т.п.
+    route: str | None = None
     route_reason: str | None = None
+    plan: list[PlanStep] | None = None
     tools_used: list[str] = Field(default_factory=list)
     display: DisplayBlock | None = None
     # --- память диалога ---
@@ -135,7 +160,9 @@ class MessageMetadata(BaseModel):
 class ChatRequest(BaseModel):
     """Тело POST /api/v1/ask и /api/v1/ask/stream."""
     message: str = Field(..., min_length=1, max_length=4000)
-    route: Literal["auto", "rag", "tool"] = "auto"
+    # route — строка (см. MessageMetadata). "auto" = пусть решает Planner.
+    # Допустимые явные значения: "rag", "tool", "rag+tool".
+    route: str = "auto"
     # --- память диалога (stateless: фронт присылает, бэк не хранит) ---
     history: list[ChatHistoryItem] = Field(default_factory=list)
     summary: str | None = None
@@ -152,10 +179,11 @@ class SSEToken(BaseModel):
 
 
 class SSERoute(BaseModel):
-    """Выбранный маршрут."""
+    """Выбранный маршрут + план шагов."""
     type: Literal["route"] = "route"
     route: str
     reason: str = ""
+    plan: list[PlanStep] | None = None
 
 
 class SSEStep(BaseModel):
@@ -174,6 +202,7 @@ class SSEMetadata(BaseModel):
     answer: str | None = None
     route: str | None = None
     route_reason: str | None = None
+    plan: list[PlanStep] | None = None
     tools_used: list[str] = Field(default_factory=list)
     display: DisplayBlock | None = None
     # --- память диалога ---

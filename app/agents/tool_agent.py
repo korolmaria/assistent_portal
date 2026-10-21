@@ -3,7 +3,6 @@ Tool-агент — вызывает инструменты SupplierPortal че�
 Поддерживает цепочки вызовов (Multi-Tool).
 """
 import json
-import re
 from datetime import datetime
 from typing import Any
 
@@ -215,7 +214,15 @@ def build_claim_details_display(items: list[dict[str, Any]]) -> dict[str, Any] |
 # ==========================================================================
 # Форматирование результата для одного инструмента
 # ==========================================================================
-def _format_tool_result(tool_name: str, parsed: Any, api_data: dict) -> tuple[str, dict | None]:
+def _format_tool_result(
+    tool_name: str, 
+    parsed: Any, 
+    api_data: dict, 
+    original_query: str = ""
+) -> tuple[str, dict | None]:
+    
+    q_lower = original_query.lower()
+
     if tool_name == "get_order_items":
         items = parsed["items"]
         amount = parsed["amount"]
@@ -230,6 +237,11 @@ def _format_tool_result(tool_name: str, parsed: Any, api_data: dict) -> tuple[st
 
     elif tool_name == "get_supplier_claims":
         claims = parsed
+        
+        # Если пользователь просил конкретный статус, а API вернул пустоту (0 записей)
+        if not claims and ("подтвержд" in q_lower or "отклон" in q_lower or "ожида" in q_lower):
+            return "Претензий с указанным статусом не найдено.", None
+
         text = build_claims_summary(claims)
         display = build_claims_display(claims)
         return text, display
@@ -258,20 +270,8 @@ async def run_tool_agent(
 ) -> tuple[str, dict[str, Any] | None, dict[str, Any]]:
     metadata: dict[str, Any] = {"route": "tool", "tools_used": []}
 
-    # Костыль для склейки истории (на случай, если query_rewriter не сработал)
+    # Костыли удалены. Полагаемся на query_rewriter, который уже подставил нужные ID.
     search_query = query
-    if history:
-        q_lower = query.lower()
-        is_followup = any(pron in q_lower for pron in ["его", "этот", "там", "него", "про него", "у него", "выше", "этом", "данном"]) or len(query) < 20
-        if is_followup:
-            for msg in reversed(history):
-                match = re.search(r'\b(980\d{5})\b', msg.content)
-                if match:
-                    order_id = match.group(1)
-                    if not re.search(r'\b(980\d{5})\b', query):
-                        search_query = f"{query} (заказ {order_id})"
-                        logger.info(f"[tool_agent] подставили заказ {order_id} из истории")
-                    break
 
     # Если инструмент задан принудительно — вызываем только его
     if forced_tool:
@@ -286,21 +286,26 @@ async def run_tool_agent(
         
         raw = await supplier_portal.call(method=tool["api_method"], data=api_data, jwt=jwt)
         parsed = tool["parser"](raw)
-        text, display = _format_tool_result(tool_name, parsed, api_data)
+        text, display = _format_tool_result(tool_name, parsed, api_data, original_query=query)
         return text, display, metadata
 
     # === ЦИКЛ ВЫЗОВА ИНСТРУМЕНТОВ (Multi-Tool) ===
-    # Получаем текущую дату, чтобы LLM не брала 2023 год из своих данных
     current_date = datetime.now().strftime("%Y-%m-%d")
     
+    # ЖЕСТКАЯ ШПАРГАЛКА ПО ДАТАМ
     system_prompt = (
         f"Ты — ассистент, который вызывает инструменты API для получения данных.\n"
         f"СЕГОДНЯШНЯЯ ДАТА: {current_date}.\n"
-        f"Если пользователь просит 'последнюю неделю', 'сегодня', 'вчера', 'за этот месяц' — "
-        f"рассчитывай даты ОТНОСИТЕЛЬНО {current_date}.\n"
+        f"⚠️ ВАЖНО: Если пользователь просит данные за конкретный месяц, используй эти точные даты:\n"
+        f"Август 2026: 2026-08-01 по 2026-08-31\n"
+        f"Сентябрь 2026: 2026-09-01 по 2026-09-30\n"
+        f"Октябрь 2026: 2026-10-01 по 2026-10-31\n"
+        "Если просит 'последнюю неделю', 'сегодня', 'вчера' — рассчитывай от текущей даты.\n"
         "Если для ответа нужно несколько действий (например, сначала найти ID претензии, "
         "а потом посмотреть её детали), вызывай инструменты последовательно.\n"
         "Не выдумывай параметры. Если не хватает данных, вызывай следующий инструмент.\n"
+        "⚠️ НЕ ВЫЗЫВАЙ ОДИН И ТОТ ЖЕ ИНСТРУМЕНТ ДВАЖДЫ В ОДНОМ ШАГЕ! "
+        "Если нужно запросить данные за два месяца, сделай два отдельных шага.\n"
     )
 
     messages = [
@@ -308,10 +313,11 @@ async def run_tool_agent(
         {"role": "user", "content": search_query},
     ]
 
-    last_text = "Не удалось получить данные."
-    last_display = None
+    # Накопители результатов
+    all_texts: list[str] = []
+    all_displays: list[dict] = []
 
-    # Максимум 3 шага, чтобы избежать бесконечных циклов
+    # Максимум 3 шага
     for step in range(3):
         message = await vllm_client.chat_with_tools(
             messages=messages,
@@ -321,7 +327,7 @@ async def run_tool_agent(
         )
 
         if not message.tool_calls:
-            break  # Инструменты больше не нужны, выходим из цикла
+            break  # Инструменты больше не нужны
 
         # Добавляем сообщение от ассистента с tool_calls в историю
         messages.append({
@@ -336,7 +342,7 @@ async def run_tool_agent(
             ]
         })
 
-        # Выполняем ВСЕ инструменты, которые запросила модель на этом шаге
+        # Выполняем ВСЕ инструменты
         for tool_call in message.tool_calls:
             tool_name = tool_call.function.name
             try:
@@ -371,14 +377,25 @@ async def run_tool_agent(
             try:
                 raw = await supplier_portal.call(method=tool["api_method"], data=api_data, jwt=jwt)
                 parsed = tool["parser"](raw)
-                text, display = _format_tool_result(tool_name, parsed, api_data)
+                text, display = _format_tool_result(tool_name, parsed, api_data, original_query=query)
                 
-                # Сохраняем последний результат
-                last_text = text
+                # СОХРАНЯЕМ ВСЕ РЕЗУЛЬТАТЫ
+                if text and text not in all_texts:
+                    all_texts.append(text)
                 if display:
-                    last_display = display
+                    # Если это таблица заказов, объединяем данные
+                    if display.get("type") == "table" and isinstance(display.get("data"), list):
+                        existing_table = next((d for d in all_displays if d.get("type") == "table"), None)
+                        if existing_table:
+                            existing_table["data"].extend(display["data"])
+                            existing_table["extra"]["count"] = len(existing_table["data"])
+                            existing_table["extra"]["total_sum"] = sum(float(o.get("sum") or 0) for o in existing_table["data"] if o.get("sum") is not None)
+                        else:
+                            all_displays.append(display)
+                    else:
+                        all_displays.append(display)
 
-                # Отправляем результат обратно в LLM, чтобы она могла решить, что делать дальше
+                # Отправляем результат обратно в LLM
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tool_call.id,
@@ -393,4 +410,10 @@ async def run_tool_agent(
                     "content": f"Ошибка API: {e}"
                 })
 
-    return last_text, last_display, metadata
+    # Собираем финальный ответ
+    final_text = "\n\n".join(all_texts) if all_texts else "Не удалось получить данные."
+    
+    # Берем первый display (если это таблица заказов, то она уже объединена)
+    final_display = all_displays[0] if all_displays else None
+
+    return final_text, final_display, metadata

@@ -1,6 +1,8 @@
 """
 Детерминированный пре-фильтр маршрута.
 Срабатывает ДО LLM-роутера. Возвращает route или None (пусть решает LLM).
+
+Дополнительно: wants_analyst() — сигнал для планера, нужен ли шаг аналитика.
 """
 import re
 from loguru import logger
@@ -21,7 +23,6 @@ def _extract_names_from_spec(param_name: str) -> list[str]:
         names: list[str] = []
         for m in matches:
             clean = m.strip()
-            # Убираем "ская обл", "ский" и т.д., оставляем корень
             clean = re.sub(r"(ская|ский)\s+обл", "", clean).strip()
             clean = re.sub(r"(ская|ский)", "", clean).strip()
             if clean:
@@ -34,7 +35,6 @@ def _extract_names_from_spec(param_name: str) -> list[str]:
 BRANDS = _extract_names_from_spec("brand_ids") if ORDERS_SPEC else []
 REGIONS = _extract_names_from_spec("region_ids") if ORDERS_SPEC else []
 
-# Fallback, если SPEC не подгрузился
 if not BRANDS:
     BRANDS = ["евроопт", "хит", "грошык", "санта", "алми"]
 if not REGIONS:
@@ -44,10 +44,8 @@ if not REGIONS:
 # РЕГУЛЯРКИ
 # ============================================================
 
-# Номер заказа / претензии: 6+ цифр подряд
 ID_RE = re.compile(r"\b\d{6,}\b")
 
-# Период
 _MONTHS = (
     r"(?:январ|феврал|март|апрел|ма[йя]|июн|июл|август|"
     r"сентябр|октябр|ноябр|декабр)\w*"
@@ -60,30 +58,40 @@ DATE_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Бренды
 BRAND_RE = re.compile(rf"\b(?:{'|'.join(BRANDS)})\b", re.IGNORECASE) if BRANDS else None
 
-# Склад
 WAREHOUSE_RE = re.compile(r"\bсклад\w*\s*№?\s*\d+", re.IGNORECASE)
 
-# Регионы
 REGION_RE = re.compile(rf"\b(?:по|в)\s+(?:{'|'.join(REGIONS)})\w*\b", re.IGNORECASE) if REGIONS else None
 
-# Статусы заказов (из SPEC)
 ORDER_STATUS_RE = re.compile(
     r"\b(?:на\s+сайте|автоподтверждён\w*|подтверждён\w*|выполнен\w*|отменён\w*)\b",
     re.IGNORECASE,
 )
 
-# Претензии
 CLAIM_RE = re.compile(
     r"\b(?:претензи\w*|брак\w*|возврат\w*|рекламаци\w*|недопоставк\w*)\b",
     re.IGNORECASE,
 )
 
-# Суперлативы (запрос конкретного экземпляра: первая, последняя, самая дорогая)
 SUPERLATIVE_RE = re.compile(
     r"\b(?:перв\w+|последн\w+|крайн\w+|сам\w+\s+(?:дорог\w+|дешев\w+|больш\w+|маленьк\w+))\b",
+    re.IGNORECASE,
+)
+
+# Аналитик: сравнение / тренд / причины / агрегаты
+ANALYST_RE = re.compile(
+    r"\b(?:сравн\w*|тренд\w*|динамик\w*|проанализ\w*|"
+    r"статистик\w*|доля|процент\w*|средн\w+|отклонен\w*|"
+    r"почему|из-за чего|во сколько раз|больше\s+чем|меньше\s+чем|"
+    r"насколько\s+больше|насколько\s+меньше)\b",
+    re.IGNORECASE,
+)
+
+# Маркеры вопросов к документации (RAG)
+DOCS_RE = re.compile(
+    r"\b(?:требовани\w*|инструкци\w*|правил\w*|регламент\w*|метод\w*\s+api|"
+    r"как\s+[а-я]+|каким\s+образом|описани\w*|документаци\w*)\b",
     re.IGNORECASE,
 )
 
@@ -121,6 +129,11 @@ def check_filters(query: str) -> tuple[bool, dict[str, bool]]:
     return any(flags.values()), flags
 
 
+def wants_analyst(query: str) -> bool:
+    """Нужен ли шаг аналитика. Только сигнал — маршрут решает planner."""
+    return bool(ANALYST_RE.search(query))
+
+
 def hard_route(query: str) -> tuple[str | None, str]:
     """
     Возвращает (route | None, reason).
@@ -131,9 +144,24 @@ def hard_route(query: str) -> tuple[str | None, str]:
     has_show = any(k in q for k in SHOW_KW)
     has_how  = any(k in q for k in HOW_KW)
 
-    # 1. Суперлативы (первая, последняя, самая дорогая) → всегда tool
+    # =========================================================================
+    # НОВОЕ: Составные вопросы (документы + данные)
+    # =========================================================================
+    # Если запрос содержит и вопрос про документы (требования, правила),
+    # и вопрос про данные (заказы, претензии, склад) — отдаем решение LLM,
+    # чтобы она собрала комбинированный план [rag, tool] или [rag, tool, analyst].
+    has_docs_marker = bool(DOCS_RE.search(query))
+    has_data_marker = (
+        flags["id"] or flags["date"] or flags["brand"] or flags["warehouse"] or
+        flags["region"] or flags["status"] or flags["claim"] or flags["superlative"] or
+        any(k in q for k in ("заказ", "претензи", "товар", "склад"))
+    )
+    if has_docs_marker and has_data_marker:
+        return None, f"rule: составной вопрос (документы + данные) → LLM"
+
+    # 1. Суперлативы → tool
     if flags["superlative"]:
-        return "tool", f"rule: суперлатив (первая/последняя) {flags}"
+        return "tool", f"rule: суперлатив {flags}"
 
     # 2. Претензии — отдельная логика
     if flags["claim"]:
