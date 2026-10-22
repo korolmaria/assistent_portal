@@ -8,6 +8,7 @@ from typing import Any, Literal
 from loguru import logger
 
 from app.agents.memory import format_history, format_summary
+from app.config import settings
 from app.llm.vllm_client import vllm_client
 from app.schemas import ChatHistoryItem, Source
 
@@ -45,6 +46,12 @@ SYSTEM_PROMPT = """Ты — ИИ-помощник для поставщиков 
      • статусы (10, 50, 60, 90)
      • названия кнопок интерфейса («Подтвердить поставку»)
    НЕ заменяй технические термины на общие слова («метод», «запрос», «API»).
+   
+   ⚠️ КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО:
+     • Придумывать URL-адреса, которых нет в контексте.
+     • Придумывать названия методов API, которых нет в контексте.
+     • Придумывать значения параметров (например, "Full", "true"), которых нет в контексте.
+     • Если в контексте для параметра написано `"[ConfirmType]"`, то так и пиши, НЕ заменяй на "Full" или "Partial".
 
 9. ДАННЫЕ ИЗ API (tool-запросы):
    Если тебе даны данные о заказах (в карточке/таблице) — ОТВЕЧАЙ НА ВОПРОС,
@@ -92,6 +99,14 @@ SYSTEM_PROMPT = """Ты — ИИ-помощник для поставщиков 
     Даже если в таблице данных нет прямого ответа, но в блоке «=== АНАЛИЗ ===» написано,
     что данных недостаточно — ты ОБЯЗАН сообщить пользователю именно это («Аналитик сообщает, что...»).
     НИКОГДА не пиши «В предоставленных данных нет ответа», если блок АНАЛИЗ не пуст.
+
+14. ЕСЛИ НЕ УВЕРЕН В НОМЕРЕ СТРАНИЦЫ:
+    Если ты не можешь точно определить номер страницы (page) из контекста — 
+    НЕ пиши ссылку [doc_id:pN] вообще. Лучше ответ без ссылки, чем с неправильной.
+
+15. URL В КОНТЕКСТЕ:
+    Если в контексте указан URL (например, `https://rest.eurotorg.by/10195/Json` или `https://rest.eurotorg.by/10165/Json`), 
+    приведи его ДОСЛОВНО, без изменений.
 
 СТИЛЬ:
 - Профессиональный, деловой.
@@ -184,20 +199,36 @@ async def synthesize(
     if not rag_chunks and not tool_results and not extra_text:
         return ("К сожалению, у меня нет информации по этому вопросу.", [], [])
 
-    # === 3. Контекст ===
+    # === 3. Контекст (с ограничением по символам и заменой URL) ===
     context_parts: list[str] = []
     sources: list[Source] = []
     tools_used: list[str] = []
 
+    MAX_CONTEXT_CHARS = 20000
+    current_context_len = 0
+    api_url = settings.supplier_portal_url  # <-- URL из config.py
+
     if rag_chunks:
         context_parts.append("=== ФРАГМЕНТЫ ИЗ ДОКУМЕНТОВ ===\n")
         for i, ch in enumerate(rag_chunks, 1):
+            chunk_text = ch.get("text", "")
+            if current_context_len + len(chunk_text) > MAX_CONTEXT_CHARS:
+                logger.warning(f"[synthesis] контекст обрезан на чанке {i} (лимит {MAX_CONTEXT_CHARS} симв.)")
+                break
+
+            # ⚠️ ЗАМЕНА [ip]:[port] НА URL ИЗ ОКРУЖЕНИЯ
+            chunk_text = chunk_text.replace("[ip]:[port]", api_url)
+            chunk_text = chunk_text.replace("[ip]", api_url)
+            chunk_text = chunk_text.replace("[port]", "")
+
             header = f"[{i}] doc_id={ch.get('document_id', '')}"
             if ch.get("page"):
                 header += f" | стр. {ch['page']}"
             if ch.get("section"):
                 header += f" | раздел: {ch['section']}"
-            context_parts.append(f"{header}\n{ch['text']}\n")
+            block = f"{header}\n{chunk_text}\n"
+            context_parts.append(block)
+            current_context_len += len(block)
 
             sources.append(Source(
                 doc_id=ch.get("document_id", ""),
@@ -206,7 +237,7 @@ async def synthesize(
                 page_label=ch.get("page_label"),
                 section=ch.get("section", ""),
                 content_type=ch.get("element_type", "text"),
-                snippet=ch["text"][:200],
+                snippet=chunk_text[:200],
                 grade_score=ch.get("score"),
             ))
 
@@ -228,7 +259,6 @@ async def synthesize(
                 context_parts.append(json.dumps(data, ensure_ascii=False)[:8000])
             context_parts.append("")
 
-    # === НОВОЕ: блок анализа ===
     if analysis:
         context_parts.append("\n=== АНАЛИЗ ===\n")
         context_parts.append(analysis)
@@ -279,8 +309,14 @@ async def synthesize(
     elif has_rag and is_technical:
         instruction = (
             "⚠️ ЗАПРОС ТЕХНИЧЕСКИЙ! Пользователь спрашивает про метод/API/технику. "
-            "ОБЯЗАТЕЛЬНО назови КОНКРЕТНЫЙ метод API, URL и параметры запроса. "
-            "Ссылки в формате [doc_id:pN]."
+            "ОБЯЗАТЕЛЬНО назови КОНКРЕТНЫЙ метод API и его параметры, ЕСЛИ ОНИ ЕСТЬ В КОНТЕКСТЕ.\n\n"
+            "⚠️ ЖЕЛЕЗНОЕ ПРАВИЛО:\n"
+            "• Если в контексте указан URL (например, `https://rest.eurotorg.by/10195/Json` или `https://rest.eurotorg.by/10165/Json`), "
+            "приведи ЕГО ДОСЛОВНО.\n"
+            "• Если в контексте для параметра написано `[ConfirmType]`, так и пиши `[ConfirmType]`, "
+            "НЕ ПРИДУМЫВАЙ значения вроде 'Full' или 'true'.\n"
+            "• КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО придумывать URL или параметры, которых нет в тексте.\n"
+            "• Ссылки на документы в формате [doc_id:pN]."
         )
     elif has_rag:
         instruction = (
@@ -338,12 +374,22 @@ async def synthesize(
 
 Ответ:"""
 
-    # === 7. max_tokens ===
-    actual_max_tokens = max_tokens
+    # === 7. Динамический max_tokens с учетом размера контекста ===
+    estimated_input_tokens = len(prompt) // 2.5
+    MAX_MODEL_TOKENS = 16384
+    available_output_tokens = MAX_MODEL_TOKENS - estimated_input_tokens - 500
+    actual_max_tokens = max(300, min(max_tokens, int(available_output_tokens)))
+    
+    if actual_max_tokens < max_tokens:
+        logger.warning(
+            f"[synthesis] уменьшаю max_tokens: {max_tokens} -> {actual_max_tokens} "
+            f"(контекст ~{estimated_input_tokens:.0f} токенов)"
+        )
+    
     if mode == "analysis":
-        actual_max_tokens = 1200
+        actual_max_tokens = min(actual_max_tokens, 1200)
     elif has_tool and not has_rag and has_display:
-        actual_max_tokens = 1000
+        actual_max_tokens = min(actual_max_tokens, 1000)
 
     logger.info(
         f"[synthesis] mode={mode}, {len(rag_chunks)} rag, "

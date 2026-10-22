@@ -5,7 +5,7 @@ PDF → ParsedDocument.
 - pdfplumber — текст + таблицы
 - Qwen2.5-VL — скриншоты и таблицы (для точного извлечения)
 
-Колонтитулы вырезаются.
+Колонтитулы вырезаются, но номер страницы берется ИЗ НИХ.
 """
 import json
 import re
@@ -21,13 +21,18 @@ from app.llm.vllm_client import vllm_client
 
 
 # ==========================================================================
-# Вырезание колонтитулов
+# Колонтитулы и мусор
 # ==========================================================================
+# Регулярка для поиска номера страницы в колонтитуле (например, "Страница 21 из 29")
+PAGE_FOOTER_RE = re.compile(r"Страница\s+(\d+)\s+из\s+(\d+)", re.IGNORECASE)
+
+# Регулярки для вырезания колонтитулов из текста
 HEADER_PATTERNS = [
     re.compile(r"Инструкция\s*по\s*работе\s*с\s*Web-сервисом", re.IGNORECASE),
     re.compile(r"«Личный\s*кабинет\s*поставщика»", re.IGNORECASE),
     re.compile(r"\d{1,2}\s+[а-я]+\s+\d{4}\s*г\.", re.IGNORECASE),
     re.compile(r"^\s*\d+\s*$"),
+    re.compile(r"Страница\s+\d+\s+из\s+\d+", re.IGNORECASE),  # <-- ВЫРЕЗАЕМ КОЛОНТИТУЛ ИЗ ТЕКСТА
 ]
 
 
@@ -45,6 +50,19 @@ def clean_page_text(text: str) -> str:
             continue
         cleaned.append(line)
     return "\n".join(cleaned)
+
+
+def _is_garbage_text(text: str) -> bool:
+    """
+    Проверяет, является ли текст мусором (только цифры и пробелы).
+    Например, страницы, где написано "1 1 1 1 1 1..." или "1 2 3 4 5...".
+    """
+    if not text:
+        return True
+    # Убираем все пробелы, переносы, точки
+    cleaned = text.replace(" ", "").replace("\n", "").replace("\t", "").replace(".", "")
+    # Если остались только цифры и их много — это мусор
+    return cleaned.isdigit() and len(cleaned) > 20
 
 
 # ==========================================================================
@@ -96,7 +114,7 @@ VL_TABLE_PROMPT = """Извлеки таблицу со страницы док�
 # Хелперы
 # ==========================================================================
 def _extract_json(text: str) -> dict[str, Any]:
-    """Извлекает JSON из ответа LLM."""
+    """Извлекает JSON из ответа LLM с попыткой починки."""
     text = text.strip()
     text = re.sub(r"^```(?:json)?\s*", "", text)
     text = re.sub(r"\s*```$", "", text)
@@ -104,11 +122,36 @@ def _extract_json(text: str) -> dict[str, Any]:
     end = text.rfind("}")
     if start == -1 or end == -1:
         raise ValueError(f"Не найден JSON: {text[:200]}")
-    return json.loads(text[start : end + 1])
+    
+    json_str = text[start : end + 1]
+    
+    # Попытка 1: обычный json.loads
+    try:
+        return json.loads(json_str)
+    except json.JSONDecodeError as e:
+        logger.warning(f"[pdf_parser] json.loads упал: {e}. Пытаюсь починить...")
+    
+    # Попытка 2: фикс забытых запятых
+    fixed = re.sub(r'(["\d\]])\s*\n\s*(["\d\[])', r'\1,\n\2', json_str)
+    try:
+        return json.loads(fixed)
+    except json.JSONDecodeError:
+        pass
+    
+    # Попытка 3: json_repair
+    try:
+        from json_repair import repair_json
+        return json.loads(repair_json(json_str))
+    except ImportError:
+        pass
+    except Exception:
+        pass
+    
+    logger.error(f"[pdf_parser] не удалось распарсить JSON: {json_str[:300]}")
+    return {}
 
 
 async def _vl_parse_screenshot(image_path: Path) -> list[dict[str, Any]]:
-    """VL-парсинг скриншота → элементы."""
     try:
         response = await vllm_client.generate_with_image(
             image_path=image_path,
@@ -117,8 +160,10 @@ async def _vl_parse_screenshot(image_path: Path) -> list[dict[str, Any]]:
             temperature=0.1,
         )
         parsed = _extract_json(response)
+        if not parsed:
+            return []
+        
         elements = []
-
         if parsed.get("title"):
             elements.append({"type": "header", "level": 2, "text": parsed["title"]})
         if parsed.get("description"):
@@ -142,7 +187,6 @@ async def _vl_parse_screenshot(image_path: Path) -> list[dict[str, Any]]:
 
 
 async def _vl_parse_tables(image_path: Path) -> list[dict[str, Any]]:
-    """VL-парсинг таблицы → элементы."""
     try:
         response = await vllm_client.generate_with_image(
             image_path=image_path,
@@ -151,6 +195,9 @@ async def _vl_parse_tables(image_path: Path) -> list[dict[str, Any]]:
             temperature=0.1,
         )
         parsed = _extract_json(response)
+        if not parsed:
+            return []
+        
         elements = []
         for tbl in parsed.get("tables", []):
             rows = tbl.get("rows", [])
@@ -175,10 +222,6 @@ async def parse_pdf(
     dpi: int = 150,
     max_pages: int | None = None,
 ) -> dict[str, Any]:
-    """
-    PDF → ParsedDocument.
-    Гибрид: pdfplumber + VL для скриншотов и таблиц.
-    """
     pdf_path = Path(pdf_path)
     document_id = make_document_id(pdf_path)
     start_time = time.time()
@@ -198,12 +241,28 @@ async def parse_pdf(
 
         for i in range(total_pages):
             page = pdf.pages[i]
-            page_num = i + 1
+            physical_page_num = i + 1
 
-            text = page.extract_text() or ""
-            text = clean_page_text(text)
+            # 1. Извлекаем сырой текст (без очистки)
+            raw_text = page.extract_text() or ""
+            
+            # 2. Ищем номер страницы в колонтитуле
+            footer_match = PAGE_FOOTER_RE.search(raw_text)
+            if footer_match:
+                page_label_num = int(footer_match.group(1))
+                page_num = page_label_num  # <-- ИСПОЛЬЗУЕМ НОМЕР ИЗ КОЛОНТИТУЛА
+            else:
+                page_num = physical_page_num
+
+            # 3. Очищаем текст от колонтитулов
+            text = clean_page_text(raw_text)
+
+            # 4. Проверяем на мусор (только цифры)
+            if _is_garbage_text(text):
+                logger.debug(f"[pdf_parser] стр. {physical_page_num} (page={page_num}): мусор, пропускаем")
+                continue
+
             tables = page.extract_tables()
-
             has_tables = bool(tables)
             text_len = len(text)
             used_vl = False
@@ -215,7 +274,7 @@ async def parse_pdf(
                 vl_calls += 1
                 try:
                     pil_image = page.to_image(resolution=dpi).original
-                    img_path = tmp_dir / f"page_{page_num:03d}.png"
+                    img_path = tmp_dir / f"page_{physical_page_num:03d}.png"
                     pil_image.save(img_path, "PNG")
 
                     if has_tables:
@@ -223,33 +282,32 @@ async def parse_pdf(
                     else:
                         elements = await _vl_parse_screenshot(img_path)
 
-                    # Подпись рисунка из текста
                     if text and "Рисунок" in text:
                         for line in text.split("\n"):
                             if "Рисунок" in line:
                                 elements.insert(0, {"type": "text", "text": line})
                                 break
-                    # Заголовок раздела
                     if text:
                         for line in text.split("\n"):
                             if re.match(r"^\d+(\.\d+)*\.?\s+[А-Я]", line):
                                 elements.insert(0, {"type": "header", "level": 2, "text": line})
                                 break
                 except Exception as e:
-                    logger.error(f"[pdf_parser] стр. {page_num}: VL-ошибка: {e}")
+                    logger.error(f"[pdf_parser] стр. {physical_page_num}: VL-ошибка: {e}")
                     if text:
                         elements = [{"type": "text", "text": text}]
             else:
                 elements = [{"type": "text", "text": text}]
 
             pages.append({
-                "page": page_num,
+                "page": page_num,  # <-- ИСПОЛЬЗУЕМ НОМЕР ИЗ КОЛОНТИТУЛА
+                "page_label": f"стр. {page_num}",
                 "elements": elements,
                 "source": "vl" if used_vl else "pdfplumber",
             })
 
-            if page_num % 10 == 0 or page_num == total_pages:
-                logger.info(f"[pdf_parser] {page_num}/{total_pages} (VL: {vl_calls})")
+            if physical_page_num % 10 == 0 or physical_page_num == total_pages:
+                logger.info(f"[pdf_parser] {physical_page_num}/{total_pages} (VL: {vl_calls}, page={page_num})")
 
     # Чистка временных файлов
     for f in tmp_dir.glob("*.png"):
@@ -268,7 +326,7 @@ async def parse_pdf(
         "parser": "pdfplumber+vl",
         "pages": pages,
         "metadata": {
-            "total_pages": total_pages,
+            "total_pages": len(pages),
             "dpi": dpi,
             "parse_time_sec": round(parse_time, 2),
             "vl_calls": vl_calls,
@@ -276,7 +334,7 @@ async def parse_pdf(
     }
 
     logger.info(
-        f"[pdf_parser] ✅ {pdf_path.name}: {total_pages} стр. "
+        f"[pdf_parser] ✅ {pdf_path.name}: {len(pages)} стр. "
         f"(VL: {vl_calls}) за {parse_time:.1f} сек"
     )
     return result

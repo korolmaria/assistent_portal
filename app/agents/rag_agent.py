@@ -1,14 +1,5 @@
 """
 RAG-агент: гибридный поиск + реранкинг + расширение соседями.
-
-Возвращает:
-- top-K чанков с метаданными (+ соседние чанки для сохранения контекста)
-- список Source для фронта
-- готовый контекст для LLM
-
-Ключевая фича: expand_with_neighbors — подтягивает prev/next чанки,
-чтобы технические описания (метод + URL + JSON), разрезанные между
-чанками, попадали в контекст вместе.
 """
 from typing import Any
 
@@ -19,9 +10,23 @@ from app.tools.qdrant_client import qdrant_db
 from app.tools.triton_client import triton_client
 
 
-CANDIDATES_TOP_K = 20
-RERANK_TOP_K = 5
-MIN_RERANK_SCORE = 0.01
+CANDIDATES_TOP_K = 25     
+RERANK_TOP_K = 8           
+MIN_RERANK_SCORE = 0.01    # Вернули нормальный порог
+RERANK_BATCH_SIZE = 32     # Лимит Triton
+
+
+def _rerank_in_batches(query: str, texts: list[str]) -> list[float]:
+    """Реранкинг с разбивкой на батчи (Triton не принимает > 32 текстов за раз)."""
+    if not texts:
+        return []
+    scores: list[float] = []
+    for i in range(0, len(texts), RERANK_BATCH_SIZE):
+        batch = texts[i:i + RERANK_BATCH_SIZE]
+        batch_scores = triton_client.rerank(query, batch)
+        scores.extend(batch_scores)
+        logger.debug(f"[rag_agent] реранкинг батча {i // RERANK_BATCH_SIZE + 1}: {len(batch)} текстов")
+    return scores
 
 
 def search(
@@ -33,23 +38,13 @@ def search(
 ) -> tuple[list[dict[str, Any]], list[Source]]:
     """
     RAG-поиск: dense + sparse + RRF + реранкинг + расширение соседями.
-
-    Args:
-        query: вопрос пользователя
-        top_k: сколько чанков вернуть после реранкинга
-        min_score: минимальный реранк-скор
-        filter_conditions: фильтры Qdrant
-        expand_neighbors: подтягивать ли соседние чанки (prev/next)
-
-    Returns:
-        (chunks, sources)
     """
     logger.info(f"[rag_agent] поиск: {query[:80]}")
 
     # 1. Dense-эмбеддинг запроса
     dense = triton_client.embed([query])[0].tolist()
 
-    # 2. Гибридный поиск (dense + sparse + RRF)
+    # 2. Гибридный поиск
     candidates = qdrant_db.hybrid_search(
         query=query,
         dense_vector=dense,
@@ -59,24 +54,70 @@ def search(
     )
     logger.info(f"[rag_agent] кандидатов из Qdrant: {len(candidates)}")
 
+    # === ФОЛБЭК ДЛЯ API-ЗАПРОСОВ ===
+    query_lower = query.lower()
+    is_api_query = any(kw in query_lower for kw in ["метод", "api", "запрос", "post", "get"])
+    
+    if is_api_query:
+        logger.info("[rag_agent] API-запрос: применяю фолбэк-поиск по ключевым словам")
+        try:
+            from qdrant_client.models import Filter, FieldCondition, MatchText
+            
+            scroll_res, _ = qdrant_db.client.scroll(
+                collection_name=qdrant_db.collection,
+                scroll_filter=Filter(
+                    must=[
+                        FieldCondition(key="text", match=MatchText(text="MethodName")),
+                    ]
+                ),
+                limit=10, 
+                with_payload=True
+            )
+            
+            for p in scroll_res:
+                if not any(c["id"] == p.id for c in candidates):
+                    candidates.append({
+                        "id": p.id,
+                        "payload": p.payload,
+                        "score": 10.0,
+                    })
+                    logger.debug(f"[rag_agent] фолбэк: добавлен чанк {p.id} ({p.payload.get('source_file')})")
+        except Exception as e:
+            logger.warning(f"[rag_agent] фолбэк-поиск не удался: {e}")
+
     if not candidates:
         return [], []
 
-    # 3. Реранкинг
-    texts = [c["payload"].get("text", "") for c in candidates]
-    rerank_scores = triton_client.rerank(query, texts)
-    logger.info(
-        f"[rag_agent] реранк: min={min(rerank_scores):.4f}, "
-        f"max={max(rerank_scores):.4f}"
-    )
-
+    # 3. Реранкинг (с разбивкой на батчи)
+    texts = [
+        f"{c['payload'].get('section', '')}\n{c['payload'].get('text', '')}"
+        for c in candidates
+    ]
+    logger.info(f"[rag_agent] отправляю на реранкинг {len(texts)} текстов (батчами по {RERANK_BATCH_SIZE})")
+    rerank_scores = _rerank_in_batches(query, texts)
+    logger.info(f"[rag_agent] реранкинг завершён для {len(rerank_scores)} текстов")
+    
+    # === ПРИНУДИТЕЛЬНЫЙ БУСТ ДЛЯ API-МЕТОДОВ ===
+    boosted_count = 0
+    for i, (cand, score) in enumerate(zip(candidates, rerank_scores)):
+        text = cand["payload"].get("text", "")
+        if "MethodName" in text or "POST /SUPPLIERPORTAL" in text or "POST SUPPLIERPORTAL" in text:
+            if score < 0.9:
+                rerank_scores[i] = 0.9
+                boosted_count += 1
+                logger.debug(f"[rag_agent] буст для API-чанка {cand['id']}: {score:.4f} -> 0.9")
+    
+    if boosted_count:
+        logger.info(f"[rag_agent] применён буст для {boosted_count} API-чанков")
+    
     # 4. Сортировка по реранк-скору
     reranked = sorted(zip(candidates, rerank_scores), key=lambda x: -x[1])
 
-    # 5. Фильтр + top_k + дедупликация sources по (doc_id, page)
+    # 5. Фильтр + top_k
     results: list[dict[str, Any]] = []
     sources: list[Source] = []
     seen_pages: set[tuple[str, int | None]] = set()
+    force_expand_ids = set()
 
     for cand, r_score in reranked:
         if r_score < min_score:
@@ -88,6 +129,7 @@ def search(
         text = payload.get("text", "")
         doc_id = payload.get("document_id", "")
         page = payload.get("page")
+        source_file = payload.get("source_file", "")
 
         chunk = {
             "id": cand["id"],
@@ -95,7 +137,7 @@ def search(
             "score": round(r_score, 4),
             "rrf_score": round(cand["score"], 4),
             "document_id": doc_id,
-            "source_file": payload.get("source_file"),
+            "source_file": source_file,
             "page": page,
             "page_label": payload.get("page_label"),
             "section": payload.get("section"),
@@ -106,13 +148,16 @@ def search(
         }
         results.append(chunk)
 
-        # В sources — только уникальные (doc_id, page)
+        if "MethodName" in text or "POST /SUPPLIERPORTAL" in text or "POST SUPPLIERPORTAL" in text:
+            force_expand_ids.add(cand["id"])
+            logger.debug(f"[rag_agent] найден API-метод, принудительное расширение для {cand['id']}")
+
         key = (doc_id, page)
         if key not in seen_pages:
             seen_pages.add(key)
             sources.append(Source(
                 doc_id=doc_id,
-                doc_title=payload.get("source_file", ""),
+                doc_title=source_file,
                 page=page,
                 page_label=payload.get("page_label"),
                 section=payload.get("section", ""),
@@ -121,17 +166,35 @@ def search(
                 grade_score=round(r_score, 4),
             ))
 
+    # === ФИЛЬТРАЦИЯ ДЛЯ API-ЗАПРОСОВ ===
+    # Если запрос про API, оставляем только технические чанки,
+    # чтобы LLM не смотрела на "кнопки в интерфейсе" и не галлюцинировала.
+    if is_api_query and results:
+        api_results = [
+            r for r in results 
+            if "MethodName" in r["text"] 
+            or "POST /SUPPLIERPORTAL" in r["text"]
+            or "API_инструкция" in r["source_file"]
+        ]
+        if api_results:
+            logger.info(f"[rag_agent] фильтр API: было {len(results)}, осталось {len(api_results)}")
+            results = api_results
+            # Обновляем sources
+            sources = [s for s in sources if "API_инструкция" in s.doc_title or "api" in s.doc_title.lower()]
+
     logger.info(
         f"[rag_agent] финальных чанков: {len(results)}, "
         f"уникальных источников: {len(sources)}"
     )
 
-    # 6. Расширение соседями (для сохранения контекста техописаний)
-    if expand_neighbors:
-        expanded = expand_with_neighbors(results, max_neighbors=1)
-        logger.info(
-            f"[rag_agent] после расширения: {len(expanded)} чанков"
+    # 6. Расширение соседями
+    if expand_neighbors or force_expand_ids:
+        expanded = expand_with_neighbors(
+            results, 
+            max_neighbors=2, 
+            force_expand_ids=force_expand_ids
         )
+        logger.info(f"[rag_agent] после расширения: {len(expanded)} чанков")
         return expanded, sources
 
     return results, sources
@@ -140,28 +203,16 @@ def search(
 def expand_with_neighbors(
     chunks: list[dict[str, Any]],
     max_neighbors: int = 1,
+    force_expand_ids: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     """
-    Расширяет список чанков соседними (prev/next) из Qdrant.
-
-    Это помогает сохранить технические детали, разрезанные между чанками:
-    - Имя метода в одном чанке
-    - URL в другом
-    - JSON-параметры в третьем
-
-    Дедупликация по (document_id, chunk_index).
-
-    Args:
-        chunks: исходные чанки от RAG
-        max_neighbors: сколько соседей с каждой стороны подтягивать
-
-    Returns:
-        Расширенный список, отсортированный по (document_id, chunk_index).
+    Расширяет список чанков соседними.
     """
     if not chunks:
         return chunks
 
-    # Дедупликация исходных по (document_id, chunk_index)
+    force_expand_ids = force_expand_ids or set()
+
     seen_keys: set[tuple[str, int]] = set()
     unique_chunks: list[dict[str, Any]] = []
     for ch in chunks:
@@ -171,67 +222,77 @@ def expand_with_neighbors(
         seen_keys.add(key)
         unique_chunks.append(ch)
 
-    logger.info(
-        f"[rag_agent] expand: исходных {len(chunks)} → "
-        f"уникальных {len(unique_chunks)}"
-    )
-
     extra: list[dict[str, Any]] = []
 
     for ch in unique_chunks:
-        prev_id = ch.get("prev_chunk_id")
-        next_id = ch.get("next_chunk_id")
+        doc_id = ch.get("document_id")
+        chunk_idx = ch.get("chunk_index")
+        
+        is_forced = ch.get("id") in force_expand_ids
+        neighbors_to_take = max_neighbors if is_forced else 1
+        
+        neighbor_ids = []
+        if ch.get("prev_chunk_id"): neighbor_ids.append(ch["prev_chunk_id"])
+        if ch.get("next_chunk_id"): neighbor_ids.append(ch["next_chunk_id"])
 
-        for neighbor_id in [prev_id, next_id]:
-            if not neighbor_id:
-                continue
-
+        for neighbor_id in neighbor_ids:
             try:
                 points = qdrant_db.client.retrieve(
                     collection_name=qdrant_db.collection,
                     ids=[neighbor_id],
                     with_payload=True,
                 )
-                if not points:
-                    logger.debug(
-                        f"[rag_agent] сосед {neighbor_id} не найден в Qdrant"
-                    )
-                    continue
-
-                p = points[0]
-                pl = p.payload or {}
-                neighbor_key = (
-                    pl.get("document_id") or "",
-                    pl.get("chunk_index") or 0,
-                )
-
-                # Пропускаем, если такой (doc_id, chunk_index) уже есть
-                if neighbor_key in seen_keys:
-                    logger.debug(
-                        f"[rag_agent] сосед {neighbor_key} уже есть"
-                    )
-                    continue
-                seen_keys.add(neighbor_key)
-
-                extra.append({
-                    "id": p.id,
-                    "text": pl.get("text", ""),
-                    "score": 0.0,
-                    "rrf_score": 0.0,
-                    "document_id": pl.get("document_id"),
-                    "source_file": pl.get("source_file"),
-                    "page": pl.get("page"),
-                    "page_label": pl.get("page_label"),
-                    "section": pl.get("section"),
-                    "element_type": pl.get("element_type"),
-                    "chunk_index": pl.get("chunk_index"),
-                    "is_neighbor": True,
-                })
-
+                if points:
+                    p = points[0]
+                    pl = p.payload or {}
+                    n_key = (pl.get("document_id") or "", pl.get("chunk_index") or 0)
+                    if n_key not in seen_keys:
+                        seen_keys.add(n_key)
+                        extra.append({
+                            "id": p.id, "text": pl.get("text", ""), "score": 0.0,
+                            "document_id": pl.get("document_id"),
+                            "source_file": pl.get("source_file"),
+                            "page": pl.get("page"), "page_label": pl.get("page_label"),
+                            "section": pl.get("section"), "element_type": pl.get("element_type"),
+                            "chunk_index": pl.get("chunk_index"), "is_neighbor": True,
+                        })
             except Exception as e:
-                logger.warning(
-                    f"[rag_agent] сосед {neighbor_id}: {e}"
-                )
+                logger.warning(f"[rag_agent] ошибка получения соседа {neighbor_id}: {e}")
+
+        if doc_id and chunk_idx is not None:
+            for offset in range(1, neighbors_to_take + 1):
+                for target_idx in [chunk_idx - offset, chunk_idx + offset]:
+                    t_key = (doc_id, target_idx)
+                    if t_key in seen_keys:
+                        continue
+                    
+                    try:
+                        from qdrant_client.models import Filter, FieldCondition, MatchValue
+                        scroll_res, _ = qdrant_db.client.scroll(
+                            collection_name=qdrant_db.collection,
+                            scroll_filter=Filter(
+                                must=[
+                                    FieldCondition(key="document_id", match=MatchValue(value=doc_id)),
+                                    FieldCondition(key="chunk_index", match=MatchValue(value=target_idx)),
+                                ]
+                            ),
+                            limit=1,
+                            with_payload=True
+                        )
+                        if scroll_res:
+                            p = scroll_res[0]
+                            pl = p.payload or {}
+                            seen_keys.add(t_key)
+                            extra.append({
+                                "id": p.id, "text": pl.get("text", ""), "score": 0.0,
+                                "document_id": pl.get("document_id"),
+                                "source_file": pl.get("source_file"),
+                                "page": pl.get("page"), "page_label": pl.get("page_label"),
+                                "section": pl.get("section"), "element_type": pl.get("element_type"),
+                                "chunk_index": pl.get("chunk_index"), "is_neighbor": True,
+                            })
+                    except Exception as e:
+                        logger.debug(f"[rag_agent] не удалось найти соседа по индексу {t_key}: {e}")
 
     all_chunks = unique_chunks + extra
     all_chunks.sort(key=lambda x: (
@@ -245,15 +306,9 @@ def expand_with_neighbors(
     return all_chunks
 
 
-def build_context(chunks: list[dict[str, Any]], max_chars: int = 8000) -> str:
+def build_context(chunks: list[dict[str, Any]], max_chars: int = 16000) -> str:
     """
-    Собирает контекст для LLM из чанков.
-
-    Формат:
-        [1] (источник, стр. X, раздел)
-        текст
-        ---
-        [2] ...
+    Собирает контекст для LLM.
     """
     parts = []
     total = 0

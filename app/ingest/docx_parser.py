@@ -2,12 +2,10 @@
 DOCX → ParsedDocument.
 
 Порядок элементов: параграф → таблица → параграф.
-Типы элементов:
-- header — заголовки (z1qcye, ALL CAPS, N. Текст, короткие без точки)
-- accent — жирные абзацы (z1qcye), отдельная мысль
-- text — обычный текст (включая JSON-код из API-инструкций)
-- list — параграф-список (начинается с •, -, *)
-- table — таблица (структурная, из python-docx)
+Умеет извлекать реальные номера страниц из:
+1. Колонтитулов (например, "Страница 56 из 68").
+2. Жестких разрывов страниц Word (w:br w:type="page").
+3. Эвристики по количеству символов (если нет ни того, ни другого).
 """
 import re
 import time
@@ -26,92 +24,44 @@ from app.ingest.document_id import make_document_id, make_section_slug
 # Эвристики для классификации параграфов
 # ==========================================================================
 def _is_all_caps(text: str) -> bool:
-    """
-    ВСЁ ЗАГЛАВНЫМИ (заголовок раздела).
-    Только для буквенных строк, исключая JSON-код и мусор.
-    """
     letters = [c for c in text if c.isalpha()]
-    if len(letters) < 3:
-        return False
-    # Если >20% символов не буквы/пробелы/цифры — это код, не заголовок
-    non_alpha = sum(
-        1 for c in text
-        if not (c.isalpha() or c.isspace() or c.isdigit())
-    )
-    if len(text) > 0 and non_alpha / len(text) > 0.2:
-        return False
+    if len(letters) < 3: return False
+    non_alpha = sum(1 for c in text if not (c.isalpha() or c.isspace() or c.isdigit()))
+    if len(text) > 0 and non_alpha / len(text) > 0.2: return False
     upper = sum(1 for c in letters if c.isupper())
     return upper / len(letters) > 0.8
 
-
 def _is_section_number(text: str) -> bool:
-    """Начинается с 'N.' или 'N.N.' (нумерованный раздел)."""
     return bool(re.match(r"^\d+(\.\d+)*\.?\s+\S", text))
 
-
 def _is_figure_caption(text: str) -> bool:
-    """Подпись рисунка: 'Рисунок 1 — ...'."""
     return bool(re.match(r"^Рисунок\s+\d+", text, re.IGNORECASE))
 
-
 def _is_list_item(text: str) -> bool:
-    """Начинается с •, -, *, → — элемент списка."""
     return bool(re.match(r"^[•\-\*→]\s+\S", text))
 
-
 def _is_code_like(text: str) -> bool:
-    """
-    Похоже на JSON-код, а не на заголовок.
-    Признаки:
-    - начинается с {, }, [, ], ", '
-    - содержит >25% не-буквенных символов
-    """
     stripped = text.lstrip()
     if stripped and stripped[0] in '{[}"\'':
         return True
     if len(text) > 0:
-        non_alpha = sum(
-            1 for c in text
-            if not (c.isalpha() or c.isspace() or c.isdigit())
-        )
-        if non_alpha / len(text) > 0.25:
-            return True
+        non_alpha = sum(1 for c in text if not (c.isalpha() or c.isspace() or c.isdigit()))
+        if non_alpha / len(text) > 0.25: return True
     return False
 
+def _is_garbage_numbers(text: str) -> bool:
+    """Проверяет, является ли строка мусором из цифр (например, '1. 2. 3. 4.' или '1 1 1 1')."""
+    cleaned = text.replace(" ", "").replace(".", "")
+    return cleaned.isdigit() and len(cleaned) > 3
 
 def _classify_paragraph(text: str, style_name: str) -> str:
-    """
-    Возвращает тип элемента: header | accent | list | text.
-    Ужесточённая эвристика — исключаем JSON-код и мусор.
-    """
     text = text.strip()
-
-    # z1qcye — жирный акцент
-    if style_name == 'z1qcye':
-        return 'accent'
-
-    # ALL CAPS → header (только буквенные строки)
-    if _is_all_caps(text):
-        return 'header'
-
-    # Нумерованный раздел → header
-    if _is_section_number(text):
-        return 'header'
-
-    # Подпись рисунка → text (не заголовок)
-    if _is_figure_caption(text):
-        return 'text'
-
-    # Список
-    if _is_list_item(text):
-        return 'list'
-
-    # JSON-код и мусор → text
-    if _is_code_like(text):
-        return 'text'
-
-    # Очень короткая строка без точки в конце → header
-    # УЖЕСТОЧЕНО: ≤ 8 слов, ≤ 80 символов, начинается с буквы
+    if style_name == 'z1qcye': return 'accent'
+    if _is_all_caps(text): return 'header'
+    if _is_section_number(text): return 'header'
+    if _is_figure_caption(text): return 'text'
+    if _is_list_item(text): return 'list'
+    if _is_code_like(text): return 'text'
     if (
         len(text) <= 80
         and len(text.split()) <= 8
@@ -120,7 +70,6 @@ def _classify_paragraph(text: str, style_name: str) -> str:
         and any(c.isalpha() for c in text)
     ):
         return 'header'
-
     return 'text'
 
 
@@ -128,12 +77,10 @@ def _classify_paragraph(text: str, style_name: str) -> str:
 # Парсер
 # ==========================================================================
 def _extract_table(table) -> dict[str, Any]:
-    """python-docx Table → dict с rows."""
     rows = []
     for row in table.rows:
         cells = [c.text.strip() for c in row.cells]
         rows.append(cells)
-    # Убираем полностью пустые строки
     rows = [r for r in rows if any(c for c in r)]
     return {
         "type": "table",
@@ -142,15 +89,9 @@ def _extract_table(table) -> dict[str, Any]:
         "num_cols": len(rows[0]) if rows else 0,
     }
 
-
 def _iter_block_items(doc: _Doc):
-    """
-    Итерирует параграфы и таблицы в исходном порядке документа.
-    Стандартный python-docx не сохраняет порядок — это обходной путь.
-    """
     from docx.table import Table
     from docx.text.paragraph import Paragraph
-
     parent = doc.element.body
     for child in parent.iterchildren():
         if child.tag == qn('w:p'):
@@ -158,12 +99,15 @@ def _iter_block_items(doc: _Doc):
         elif child.tag == qn('w:tbl'):
             yield Table(child, doc)
 
+def _has_page_break(paragraph) -> bool:
+    """Проверяет, содержит ли параграф жесткий разрыв страницы Word."""
+    for run in paragraph.runs:
+        for br in run._element.findall(qn('w:br')):
+            if br.get(qn('w:type')) == 'page':
+                return True
+    return False
 
 def parse_docx(docx_path: str | Path) -> dict[str, Any]:
-    """
-    DOCX → ParsedDocument.
-    Сохраняет порядок элементов: параграф → таблица → параграф.
-    """
     docx_path = Path(docx_path)
     document_id = make_document_id(docx_path)
     start_time = time.time()
@@ -171,17 +115,48 @@ def parse_docx(docx_path: str | Path) -> dict[str, Any]:
     logger.info(f"[docx_parser] начинаю: {docx_path.name}")
 
     doc = Document(str(docx_path))
-    elements: list[dict[str, Any]] = []
-
+    
+    pages_dict: dict[int, list[dict[str, Any]]] = {}
     current_section = ""
-    current_section_slug = ""
+    current_page = 1
+    heuristic_char_count = 0
+    has_footer = bool(doc.sections and doc.sections[0].footer and doc.sections[0].footer.paragraphs)
 
-    # Проходим параграфы и таблицы в порядке
+    # Регулярка для поиска страницы в колонтитулах
+    PAGE_FOOTER_RE = re.compile(r"Страница\s+(\d+)", re.IGNORECASE)
+
     for block in _iter_block_items(doc):
         if block.__class__.__name__ == 'Paragraph':
             text = block.text.strip()
-            if not text:
+            if not text: continue
+            
+            # === ОЧИСТКА ОТ МУСОРА ===
+            if _is_garbage_numbers(text):
+                logger.debug(f"[docx_parser] пропущен мусор: {text[:30]}...")
                 continue
+            
+            # === ПОИСК КОЛОНТИТУЛА ===
+            match = PAGE_FOOTER_RE.search(text)
+            if match:
+                current_page = int(match.group(1))
+                heuristic_char_count = 0
+                logger.debug(f"[docx_parser] найден колонтитул: стр. {current_page}")
+                continue
+
+            # === ЖЕСТКИЙ РАЗРЫВ СТРАНИЦЫ ===
+            # Если в параграфе есть разрыв, и на текущей странице уже что-то есть,
+            # переходим на следующую страницу.
+            if _has_page_break(block):
+                if pages_dict.get(current_page):
+                    current_page += 1
+                    heuristic_char_count = 0
+                    logger.debug(f"[docx_parser] найден разрыв страницы: стр. {current_page}")
+
+            # === ЭВРИСТИКА (если нет колонтитулов и разрывов) ===
+            heuristic_char_count += len(text)
+            if heuristic_char_count > 2500 and not has_footer:
+                current_page += 1
+                heuristic_char_count = len(text)
 
             style_name = block.style.name if block.style else 'Normal'
             etype = _classify_paragraph(text, style_name)
@@ -192,67 +167,60 @@ def parse_docx(docx_path: str | Path) -> dict[str, Any]:
                 "style": style_name,
             }
 
-            # Для header — обновляем текущий раздел
             if etype == 'header':
                 current_section = text
-                current_section_slug = make_section_slug(text)
                 el["section"] = current_section
             else:
                 el["section"] = current_section
-
-            elements.append(el)
+            
+            if current_page not in pages_dict:
+                pages_dict[current_page] = []
+            pages_dict[current_page].append(el)
 
         elif block.__class__.__name__ == 'Table':
+            # Таблицы тоже могут содержать разрывы (например, если таблица длинная),
+            # но для простоты мы просто добавляем к текущей странице.
+            heuristic_char_count += 500
+            if heuristic_char_count > 2500 and not has_footer:
+                current_page += 1
+                heuristic_char_count = 500
+
             table_el = _extract_table(block)
             table_el["section"] = current_section
-            elements.append(table_el)
-            logger.debug(
-                f"[docx_parser] таблица "
-                f"{table_el['num_rows']}x{table_el['num_cols']}"
-            )
+            
+            if current_page not in pages_dict:
+                pages_dict[current_page] = []
+            pages_dict[current_page].append(table_el)
 
     parse_time = time.time() - start_time
 
-    # Статистика
-    stats: dict[str, int] = {}
-    for el in elements:
-        stats[el["type"]] = stats.get(el["type"], 0) + 1
+    pages_list = []
+    total_elements = 0
+    stats = {}
+    for p_num in sorted(pages_dict.keys()):
+        els = pages_dict[p_num]
+        total_elements += len(els)
+        for el in els:
+            stats[el["type"]] = stats.get(el["type"], 0) + 1
+        
+        pages_list.append({
+            "page": p_num,
+            "page_label": f"стр. {p_num}",
+            "elements": els
+        })
 
     result = {
         "document_id": document_id,
         "source_file": docx_path.name,
         "source_type": "docx",
         "parser": "python-docx",
-        "pages": [
-            {
-                "page": 1,  # DOCX не имеет чётких страниц
-                "elements": elements,
-            }
-        ],
+        "pages": pages_list,
         "metadata": {
-            "total_pages": 1,
+            "total_pages": len(pages_list),
             "parse_time_sec": round(parse_time, 2),
             "elements_count": stats,
         },
     }
 
-    logger.info(
-        f"[docx_parser] ✅ {docx_path.name}: "
-        f"{stats} за {parse_time:.1f} сек"
-    )
+    logger.info(f"[docx_parser] ✅ {docx_path.name}: {stats} за {parse_time:.1f} сек, страниц: {len(pages_list)}")
     return result
-
-
-# ==========================================================================
-# CLI
-# ==========================================================================
-if __name__ == "__main__":
-    import json
-    import sys
-
-    if len(sys.argv) < 2:
-        print("Usage: python -m app.ingest.docx_parser <path.docx>")
-        sys.exit(1)
-
-    result = parse_docx(sys.argv[1])
-    print(json.dumps(result, ensure_ascii=False, indent=2)[:4000])

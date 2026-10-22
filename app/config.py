@@ -46,7 +46,7 @@ class Settings(BaseSettings):
     supplier_portal_service_number_dev: str = ""
 
     # Prod
-    supplier_portal_url_prod: str = "https://rest.eurotorg.by/10196"
+    supplier_portal_url_prod: str = "https://rest.eurotorg.by/10165"
     supplier_portal_service_number_prod: str = ""
 
     # Общие

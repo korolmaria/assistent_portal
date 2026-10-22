@@ -50,7 +50,8 @@ class QdrantDB:
         logger.info(f"[qdrant] коллекция '{self.collection}' создана")
 
     def create_payload_indexes(self) -> None:
-        """Индексы для фильтрации по payload."""
+        """Индексы для фильтрации по payload и полнотекстовый для text."""
+        # 1. Индексы для фильтрации
         for field_name, field_type in [
             ("document_id", "keyword"),
             ("page", "integer"),
@@ -66,6 +67,17 @@ class QdrantDB:
                 logger.info(f"[qdrant] индекс '{field_name}' создан")
             except Exception as e:
                 logger.debug(f"[qdrant] индекс '{field_name}': {e}")
+
+        # 2. ⚠️ Полнотекстовый индекс для поля text (для фолбэк-поиска по API)
+        try:
+            self.client.create_payload_index(
+                collection_name=self.collection,
+                field_name="text",
+                field_schema="text", # Qdrant требует строку "text" для полнотекстового
+            )
+            logger.info("[qdrant] индекс 'text' (full-text) создан")
+        except Exception as e:
+            logger.debug(f"[qdrant] индекс 'text': {e}")
 
     # ------------------------------------------------------------------
     # Upsert

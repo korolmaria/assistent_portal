@@ -47,7 +47,6 @@ def _extract_jwt(authorization: str | None) -> str:
         logger.warning("[auth] Authorization header ОТСУТСТВУЕТ")
         return ""
 
-    # Логируем, что пришло (первые 80 символов — безопасно)
     logger.info(f"[auth] Authorization: {authorization[:80]}...")
 
     parts = authorization.split()
@@ -78,13 +77,6 @@ async def ask_stream(
 ):
     """
     SSE-стриминг ответа от Supervisor.
-
-    События:
-      data: {"type": "route", "route": "rag", "reason": "..."}
-      data: {"type": "step", "message": "..."}
-      data: {"type": "metadata", "answer": "...", "sources": [...],
-             "summary": "...", "summarized_up_to_id": "...", ...}
-      data: [DONE]
     """
     jwt = _extract_jwt(authorization)
     logger.info(
@@ -105,10 +97,8 @@ async def ask_stream(
                 summary=request.summary,
                 summarized_up_to_id=request.summarized_up_to_id,
             ):
-                # Добавляем processingTime в финальные метаданные
                 if event.get("type") == "metadata":
                     event["processingTime"] = round(time.time() - start_time, 2)
-
                 yield _sse_event(event)
 
             yield "data: [DONE]\n\n"
@@ -124,7 +114,7 @@ async def ask_stream(
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",  # отключить буферизацию nginx
+            "X-Accel-Buffering": "no",
         },
     )
 
@@ -194,6 +184,7 @@ async def ask(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ==========================================================================
 # ==========================================================================
 # Health check
 # ==========================================================================
