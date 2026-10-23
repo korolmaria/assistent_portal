@@ -2,7 +2,7 @@
 Клиент к vLLM (OpenAI-совместимый API).
 
 Поддерживает:
-- Текстовую генерацию через Qwen3-8B (thinking отключён на сервере)
+- Текстовую генерацию через Qwen3.8-27B
 - Мультимодальные запросы через Qwen2.5-VL (base64 картинки)
 - Tool calling для агентов (function calling)
 - Retry-логику через tenacity
@@ -45,12 +45,13 @@ class VLLMClient:
         self,
         prompt: str,
         system: str | None = None,
-        max_tokens: int = 1024,
+        max_tokens: int = 4096,
         temperature: float = 0.3,
         top_p: float = 0.95,
-        response_format: dict | None = None,  # <--- ДОБАВЛЕНО ДЛЯ GUIDED JSON
+        response_format: dict | None = None,
+        enable_thinking: bool = False,  # <-- НОВЫЙ ПАРАМЕТР
     ) -> str:
-        """Простая текстовая генерация через Qwen3-8B."""
+        """Простая текстовая генерация через Qwen3.8-27B."""
         messages: list[dict[str, str]] = []
         if system:
             messages.append({"role": "system", "content": system})
@@ -60,18 +61,23 @@ class VLLMClient:
         if response_format:
             kwargs["response_format"] = response_format
 
+        # ⚠️ Отключаем/включаем размышления
+        extra_body = {"chat_template_kwargs": {"enable_thinking": enable_thinking}}
+
         response = await self.text_client.chat.completions.create(
             model=settings.text_model_name,
             messages=messages,
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
+            extra_body=extra_body,  # <-- ПЕРЕДАЁМ ФЛАГ
             **kwargs,
         )
         content = response.choices[0].message.content or ""
         logger.debug(
             f"[generate_text] tokens in/out: "
-            f"{response.usage.prompt_tokens}/{response.usage.completion_tokens}"
+            f"{response.usage.prompt_tokens}/{response.usage.completion_tokens} "
+            f"(thinking={enable_thinking})"
         )
         return content
 
@@ -150,11 +156,15 @@ class VLLMClient:
         max_tokens: int = 2048,
         temperature: float = 0.1,
         tool_choice: str = "auto",
+        enable_thinking: bool = False,  # <-- НОВЫЙ ПАРАМЕТР
     ) -> Any:
         """
         Чат с поддержкой function calling.
         Возвращает response.choices[0].message целиком (там может быть tool_calls).
         """
+        # ⚠️ Отключаем/включаем размышления
+        extra_body = {"chat_template_kwargs": {"enable_thinking": enable_thinking}}
+
         response = await self.text_client.chat.completions.create(
             model=settings.text_model_name,
             messages=messages,
@@ -162,6 +172,7 @@ class VLLMClient:
             tool_choice=tool_choice,
             max_tokens=max_tokens,
             temperature=temperature,
+            extra_body=extra_body,  # <-- ПЕРЕДАЁМ ФЛАГ
         )
         return response.choices[0].message
 

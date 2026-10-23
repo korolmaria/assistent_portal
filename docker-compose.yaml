@@ -9,20 +9,20 @@ services:
       - ./models:/models
       - ~/.cache/huggingface:/root/.cache/huggingface
     environment:
-      - NVIDIA_VISIBLE_DEVICES=1
+      - NVIDIA_VISIBLE_DEVICES=0
       - HF_TOKEN=${HF_TOKEN:-}
     command: >
       /models/Qwen2.5-VL-7B-Instruct-AWQ
       --served-model-name qwen-vl
-      --gpu-memory-utilization 0.60
-      --max-model-len 65536
-      --limit-mm-per-prompt '{"image": 3}'
+      --gpu-memory-utilization 0.15
+      --max-model-len 16384
+      --limit-mm-per-prompt '{"image": 1}'
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
-              device_ids: ['1']
+              device_ids: ['0']
               capabilities: [gpu]
     shm_size: '16gb'
 
@@ -38,15 +38,15 @@ services:
     environment:
       - NVIDIA_VISIBLE_DEVICES=0
       - HF_TOKEN=${HF_TOKEN:-}
-      - VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
     command: >
-      /models/Qwen3-14B-AWQ
+      /models/Qwen3.8-27B-INT4-AWQ-GPTQ
       --served-model-name qwen-text
-      --gpu-memory-utilization 0.70
-      --max-model-len 16384
+      --gpu-memory-utilization 0.65
+      --max-model-len 65536
+      --trust-remote-code
+      --limit-mm-per-prompt '{"image": 0}'
       --enable-auto-tool-choice
-      --tool-call-parser hermes
-      --reasoning-parser qwen3
+      --tool-call-parser qwen3_xml
       --default-chat-template-kwargs '{"enable_thinking": false}'
     deploy:
       resources:
@@ -68,7 +68,7 @@ services:
     volumes:
       - ./triton-models:/models
     environment:
-      - NVIDIA_VISIBLE_DEVICES=1
+      - NVIDIA_VISIBLE_DEVICES=0
     command: >
       tritonserver
       --model-repository=/models
@@ -78,7 +78,7 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              device_ids: ['1']
+              device_ids: ['0']
               capabilities: [gpu]
     shm_size: '8gb'
 
@@ -106,5 +106,4 @@ services:
       - NEO4J_AUTH=neo4j/${NEO4J_PASSWORD:-changeme123}
       - NEO4J_PLUGINS=["apoc"]
       - NEO4J_dbms_memory_heap_initial__size=2G
-      - NEO4J_dbms_memory_heap_max__size=4G
-  
+      - NEO4J_dbms_memory_heap_max__size=8G
