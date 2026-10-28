@@ -3,6 +3,7 @@ Tool-агент — вызывает инструменты SupplierPortal че�
 Поддерживает цепочки вызовов (Multi-Tool).
 """
 import json
+from collections import Counter
 from datetime import datetime
 from typing import Any
 
@@ -55,6 +56,12 @@ def _fmt_qty(val) -> str:
     return f"{num:g}"
 
 
+def _status_breakdown(items: list[dict[str, Any]], field: str = "status") -> str:
+    """Строка вида «Выполнен: 14, На сайте: 16»."""
+    cnt = Counter((it.get(field) or "—") for it in items)
+    return ", ".join(f"{st}: {n}" for st, n in cnt.most_common())
+
+
 # ==========================================================================
 # Билдеры для заказов
 # ==========================================================================
@@ -63,22 +70,39 @@ def build_display_block(orders: list[dict[str, Any]]) -> dict[str, Any] | None:
         return None
     if len(orders) == 1:
         return {"type": "card", "data": orders[0], "extra": {}}
+
     total_sum = sum(float(o.get("sum") or 0) for o in orders if o.get("sum") is not None)
-    return {"type": "table", "data": orders, "extra": {"count": len(orders), "total_sum": total_sum}}
+    status_counts = dict(Counter(o.get("status") or "—" for o in orders))
+
+    return {
+        "type": "table",
+        "data": orders,
+        "extra": {
+            "count": len(orders),
+            "total_sum": total_sum,
+            "status_counts": status_counts,
+        },
+    }
 
 
 def build_human_summary(orders: list[dict[str, Any]]) -> str:
     if not orders:
         return "По вашему запросу заказы не найдены."
+
     count = len(orders)
     total = sum(float(o.get("sum") or 0) for o in orders if o.get("sum") is not None)
+
     if count == 1:
         o = orders[0]
-        order_id = o.get("order_id")
-        status = o.get("status", "—")
-        contractor = o.get("contractor") or "поставщик"
-        return f"Найден 1 заказ №{order_id} от {contractor} на сумму {total:,.2f} руб. Статус: {status}."
-    return f"Найдено {count} заказов на общую сумму {total:,.2f} руб. Подробности в таблице ниже."
+        return (
+            f"Найден 1 заказ №{o.get('order_id')} от {o.get('contractor') or 'поставщик'} "
+            f"на сумму {total:,.2f} руб. Статус: {o.get('status') or '—'}."
+        )
+
+    return (
+        f"Найдено {count} заказов на общую сумму {total:,.2f} руб. "
+        f"Статусы: {_status_breakdown(orders)}. Подробности в таблице ниже."
+    )
 
 
 # ==========================================================================
@@ -124,8 +148,14 @@ def build_items_human_summary(items: list[dict[str, Any]], amount: int, page_qty
             f"на сумму {total:,.2f} руб. Статус: {it.get('status') or '—'}."
         )
     if page_qty <= 1:
-        return f"Найдено {count} позиций {orders_part} на общую сумму {total:,.2f} руб. Подробности в таблице ниже."
-    return f"Найдено {amount} позиций {orders_part}. Показаны первые {count} на сумму {total:,.2f} руб. (стр. 1 из {page_qty})."
+        return (
+            f"Найдено {count} позиций {orders_part} на общую сумму {total:,.2f} руб. "
+            f"Статусы: {_status_breakdown(items)}. Подробности в таблице ниже."
+        )
+    return (
+        f"Найдено {amount} позиций {orders_part}. Показаны первые {count} на сумму "
+        f"{total:,.2f} руб. (стр. 1 из {page_qty}). Статусы: {_status_breakdown(items)}."
+    )
 
 
 # ==========================================================================
@@ -140,7 +170,7 @@ def build_claims_summary(claims: list[dict[str, Any]]) -> str:
     if count == 1:
         c = claims[0]
         return f"Найдена 1 претензия №{c.get('claim_id')} по заказу №{c.get('order_id')}."
-    
+
     return f"Найдено {count} претензий. Подробности в таблице ниже."
 
 
@@ -152,7 +182,7 @@ def build_claims_display(claims: list[dict[str, Any]]) -> dict[str, Any] | None:
     enriched_claims = []
     for c in claims:
         status_code = c.get("status")
-        
+
         # Переводим код в текст и цвет
         if isinstance(status_code, (int, str)) and str(status_code).isdigit():
             status_text, status_type = CLAIM_STATUS_MAP.get(
@@ -177,7 +207,10 @@ def build_claims_display(claims: list[dict[str, Any]]) -> dict[str, Any] | None:
     return {
         "type": "claims_table",
         "data": enriched_claims,
-        "extra": {"count": len(enriched_claims)},
+        "extra": {
+            "count": len(enriched_claims),
+            "status_counts": dict(Counter(c.get("status") or "—" for c in enriched_claims)),
+        },
     }
 
 
@@ -187,12 +220,12 @@ def build_claims_display(claims: list[dict[str, Any]]) -> dict[str, Any] | None:
 def build_claim_details_summary(items: list[dict[str, Any]]) -> str:
     if not items:
         return "По указанным претензиям детали не найдены."
-    
+
     claim_ids = sorted({i.get("claim_id") for i in items if i.get("claim_id")})
     claims_str = ", ".join(str(c) for c in claim_ids)
-    
+
     total_penalty = sum(float(i.get("total_penalty") or 0) for i in items if i.get("total_penalty") is not None)
-    
+
     return (
         f"Найдено {len(items)} позиций в претензии №{claims_str}. "
         f"Общая сумма штрафа: {total_penalty:,.2f} руб."
@@ -202,15 +235,15 @@ def build_claim_details_summary(items: list[dict[str, Any]]) -> str:
 def build_claim_details_display(items: list[dict[str, Any]]) -> dict[str, Any] | None:
     if not items:
         return None
-    
+
     total_penalty = sum(float(i.get("total_penalty") or 0) for i in items if i.get("total_penalty") is not None)
-    
+
     return {
         "type": "claim_details_table",
         "data": items,
         "extra": {
             "count": len(items),
-            "total_penalty": total_penalty
+            "total_penalty": total_penalty,
         },
     }
 
@@ -219,12 +252,12 @@ def build_claim_details_display(items: list[dict[str, Any]]) -> dict[str, Any] |
 # Форматирование результата для одного инструмента
 # ==========================================================================
 def _format_tool_result(
-    tool_name: str, 
-    parsed: Any, 
-    api_data: dict, 
-    original_query: str = ""
+    tool_name: str,
+    parsed: Any,
+    api_data: dict,
+    original_query: str = "",
 ) -> tuple[str, dict | None]:
-    
+
     q_lower = original_query.lower()
 
     if tool_name == "get_order_items":
@@ -241,7 +274,7 @@ def _format_tool_result(
 
     elif tool_name == "get_supplier_claims":
         claims = parsed
-        
+
         # Если пользователь просил конкретный статус, а API вернул пустоту (0 записей)
         if not claims and ("подтвержд" in q_lower or "отклон" in q_lower or "ожида" in q_lower):
             return "Претензий с указанным статусом не найдено.", None
@@ -264,6 +297,38 @@ def _format_tool_result(
 
 
 # ==========================================================================
+# Объединение display-блоков одного типа (для multi-tool)
+# ==========================================================================
+def _merge_displays(all_displays: list[dict], new_display: dict) -> None:
+    """
+    Сливает новый display в накопитель.
+    - таблицы заказов объединяются (data.extend + пересчёт extra),
+    - одинаковые одиночные карточки не дублируются,
+    - остальное добавляется как отдельный блок.
+    """
+    dtype = new_display.get("type")
+
+    if dtype == "table" and isinstance(new_display.get("data"), list):
+        existing = next((d for d in all_displays if d.get("type") == "table"), None)
+        if existing:
+            existing["data"].extend(new_display["data"])
+            existing["extra"]["count"] = len(existing["data"])
+            existing["extra"]["total_sum"] = sum(
+                float(o.get("sum") or 0) for o in existing["data"] if o.get("sum") is not None
+            )
+            existing["extra"]["status_counts"] = dict(
+                Counter(o.get("status") or "—" for o in existing["data"])
+            )
+            return
+        all_displays.append(new_display)
+        return
+
+    # не таблица — просто добавляем, если такого ещё нет
+    if new_display not in all_displays:
+        all_displays.append(new_display)
+
+
+# ==========================================================================
 # Главный запуск
 # ==========================================================================
 async def run_tool_agent(
@@ -274,7 +339,7 @@ async def run_tool_agent(
 ) -> tuple[str, dict[str, Any] | None, dict[str, Any]]:
     metadata: dict[str, Any] = {"route": "tool", "tools_used": []}
 
-    # Костыли удалены. Полагаемся на query_rewriter, который уже подставил нужные ID.
+    # Полагаемся на query_rewriter, который уже подставил нужные ID.
     search_query = query
 
     # Если инструмент задан принудительно — вызываем только его
@@ -283,11 +348,11 @@ async def run_tool_agent(
         tool = get_tool(tool_name)
         if not tool:
             raise ToolAgentError(f"Инструмент '{tool_name}' не зарегистрирован.")
-        
+
         metadata["tools_used"].append(tool_name)
         api_data = params_to_api({}, tool_name)
         logger.info(f"[tool_agent] вызов {tool['api_method']} с {api_data}")
-        
+
         raw = await supplier_portal.call(method=tool["api_method"], data=api_data, jwt=jwt)
         parsed = tool["parser"](raw)
         text, display = _format_tool_result(tool_name, parsed, api_data, original_query=query)
@@ -295,8 +360,7 @@ async def run_tool_agent(
 
     # === ЦИКЛ ВЫЗОВА ИНСТРУМЕНТОВ (Multi-Tool) ===
     current_date = datetime.now().strftime("%Y-%m-%d")
-    
-    # ЖЕСТКАЯ ШПАРГАЛКА ПО ДАТАМ
+
     system_prompt = (
         f"Ты — ассистент, который вызывает инструменты API для получения данных.\n"
         f"СЕГОДНЯШНЯЯ ДАТА: {current_date}.\n"
@@ -341,9 +405,9 @@ async def run_tool_agent(
                 {
                     "id": tc.id,
                     "type": "function",
-                    "function": {"name": tc.function.name, "arguments": tc.function.arguments}
+                    "function": {"name": tc.function.name, "arguments": tc.function.arguments},
                 } for tc in message.tool_calls
-            ]
+            ],
         })
 
         # Выполняем ВСЕ инструменты
@@ -354,25 +418,18 @@ async def run_tool_agent(
             except json.JSONDecodeError:
                 params = {}
 
-            # Применяем предохранители (защита от лишних фильтров)
-            has_order_id = "order_ids" in params and params["order_ids"]
-            if has_order_id and tool_name not in ("get_supplier_claims", "get_claim_details"):
-                forbidden = ["checkx", "date_begin", "date_end", "brand_ids", "is_processed", "goods_ids", "goods_name"]
-                for f in forbidden:
-                    if f in params:
-                        del params[f]
-            
-            query_lower = query.lower()
-            if "is_processed" in params:
-                if not any(w in query_lower for w in ["обработан", "необработан", "не обработан"]):
-                    del params["is_processed"]
+            # 1. Нормализация дат по месяцу (если модель не подставила)
+            params = normalize_month_dates(params, query)
+
+            # 2. Предохранители: срезаем конфликтующие параметры
+            params = sanitize_params(tool_name, params, query)
 
             tool = get_tool(tool_name)
             if not tool:
                 logger.warning(f"[tool_agent] LLM вызвала неизвестный инструмент: {tool_name}")
                 continue
 
-            logger.info(f"[tool_agent] Шаг {step+1}. LLM выбрал: {tool_name}({params})")
+            logger.info(f"[tool_agent] Шаг {step + 1}. LLM выбрал: {tool_name}({params})")
             metadata["tools_used"].append(tool_name)
 
             api_data = params_to_api(params, tool_name)
@@ -382,42 +439,42 @@ async def run_tool_agent(
                 raw = await supplier_portal.call(method=tool["api_method"], data=api_data, jwt=jwt)
                 parsed = tool["parser"](raw)
                 text, display = _format_tool_result(tool_name, parsed, api_data, original_query=query)
-                
+
                 # СОХРАНЯЕМ ВСЕ РЕЗУЛЬТАТЫ
                 if text and text not in all_texts:
                     all_texts.append(text)
                 if display:
-                    # Если это таблица заказов, объединяем данные
-                    if display.get("type") == "table" and isinstance(display.get("data"), list):
-                        existing_table = next((d for d in all_displays if d.get("type") == "table"), None)
-                        if existing_table:
-                            existing_table["data"].extend(display["data"])
-                            existing_table["extra"]["count"] = len(existing_table["data"])
-                            existing_table["extra"]["total_sum"] = sum(float(o.get("sum") or 0) for o in existing_table["data"] if o.get("sum") is not None)
-                        else:
-                            all_displays.append(display)
-                    else:
-                        all_displays.append(display)
+                    _merge_displays(all_displays, display)
 
                 # Отправляем результат обратно в LLM
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tool_call.id,
-                    "content": f"{text}\nДанные: {json.dumps(display, ensure_ascii=False)[:2000]}" if display else text
+                    "content": (
+                        f"{text}\nДанные: {json.dumps(display, ensure_ascii=False)[:2000]}"
+                        if display else text
+                    ),
                 })
 
-            except Exception as e:
-                logger.error(f"[tool_agent] Ошибка вызова {tool_name}: {e}")
+            except SupplierPortalError as e:
+                logger.error(f"[tool_agent] Ошибка API {tool_name}: {e}")
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tool_call.id,
-                    "content": f"Ошибка API: {e}"
+                    "content": f"Ошибка API: {e}",
+                })
+            except Exception as e:
+                logger.exception(f"[tool_agent] Непредвиденная ошибка {tool_name}: {e}")
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": f"Ошибка: {e}",
                 })
 
     # Собираем финальный ответ
     final_text = "\n\n".join(all_texts) if all_texts else "Не удалось получить данные."
-    
-    # Берем первый display (если это таблица заказов, то она уже объединена)
+
+    # Берём первый display (таблицы уже слиты через _merge_displays)
     final_display = all_displays[0] if all_displays else None
 
     return final_text, final_display, metadata
